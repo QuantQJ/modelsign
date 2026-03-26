@@ -10,7 +10,8 @@ def test_version():
     runner = CliRunner()
     result = runner.invoke(main, ["version"])
     assert result.exit_code == 0
-    assert "1.0.0" in result.output
+    import modelsign
+    assert modelsign.__version__ in result.output
 
 
 def test_keygen(tmp_path):
@@ -192,3 +193,87 @@ def test_verify_json_output(tmp_path):
     data = json.loads(result.output)
     assert data["verified"] is True
     assert data["identity"]["name"] == "json-verify"
+
+
+def test_verify_without_pubkey_warns_untrusted(tmp_path):
+    """C3 regression: verify without --pubkey must warn about untrusted embedded key."""
+    runner = CliRunner()
+
+    key_dir = tmp_path / "keys"
+    key_dir.mkdir()
+    runner.invoke(main, ["keygen", "--out", str(key_dir / "private.pem")])
+
+    model_path = tmp_path / "model.safetensors"
+    model_path.write_bytes(b"fake-model-untrusted-test")
+
+    runner.invoke(main, [
+        "sign", str(model_path),
+        "--name", "untrusted-test",
+        "--key", str(key_dir / "private.pem"),
+    ])
+
+    # Verify WITHOUT --pubkey — should still verify but warn about untrusted key
+    result = runner.invoke(main, ["verify", str(model_path)])
+    assert result.exit_code == 0
+    assert "VERIFIED" in result.output
+    assert "UNVERIFIED" in result.output or "WARNING" in result.output or "not independently trusted" in result.output
+
+
+def test_verify_tampered_file_shows_hash_mismatch(tmp_path):
+    """C1 regression: tampered file must show 'hash mismatch', not generic sig failure."""
+    runner = CliRunner()
+
+    key_dir = tmp_path / "keys"
+    key_dir.mkdir()
+    runner.invoke(main, ["keygen", "--out", str(key_dir / "private.pem")])
+
+    model_path = tmp_path / "model.safetensors"
+    model_path.write_bytes(b"original-weights")
+
+    runner.invoke(main, [
+        "sign", str(model_path),
+        "--name", "hash-test",
+        "--key", str(key_dir / "private.pem"),
+    ])
+
+    model_path.write_bytes(b"tampered-weights")
+
+    result = runner.invoke(main, [
+        "verify", str(model_path),
+        "--pubkey", str(key_dir / "public.pem"),
+    ])
+    assert result.exit_code != 0
+    assert "Hash mismatch" in result.output or "hash mismatch" in result.output
+
+
+def test_verify_forged_sig_fails(tmp_path):
+    """C3 regression: attacker-signed file with attacker key must still fail with --pubkey."""
+    runner = CliRunner()
+
+    # Legitimate key
+    legit_dir = tmp_path / "legit"
+    legit_dir.mkdir()
+    runner.invoke(main, ["keygen", "--out", str(legit_dir / "private.pem")])
+
+    # Attacker key
+    attacker_dir = tmp_path / "attacker"
+    attacker_dir.mkdir()
+    runner.invoke(main, ["keygen", "--out", str(attacker_dir / "private.pem")])
+
+    model_path = tmp_path / "model.safetensors"
+    model_path.write_bytes(b"attacker-controlled-weights")
+
+    # Attacker signs with their key
+    runner.invoke(main, [
+        "sign", str(model_path),
+        "--name", "legit-looking-model",
+        "--key", str(attacker_dir / "private.pem"),
+    ])
+
+    # Verify with legitimate pubkey — must FAIL
+    result = runner.invoke(main, [
+        "verify", str(model_path),
+        "--pubkey", str(legit_dir / "public.pem"),
+    ])
+    assert result.exit_code != 0
+    assert "FAILED" in result.output

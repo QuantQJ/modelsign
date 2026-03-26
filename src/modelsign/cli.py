@@ -239,24 +239,42 @@ def verify(model_path, sig_path, pubkey_path, output_json, quiet):
             click.echo(f"Error: model not found: {model_path}", err=True)
         sys.exit(2)
 
-    # Read sig
+    # Read sig (C2 fix: validate fingerprint matches embedded public key)
     try:
-        sig = read_sig(sig_file_path)
+        sig = read_sig(sig_file_path, validate_fingerprint=True)
+    except ValueError as e:
+        if not quiet:
+            click.echo(f"FAILED {model_path.name}\n  Sig file corrupted: {e}", err=True)
+        sys.exit(1)
     except Exception as e:
         if not quiet:
             click.echo(f"Error reading sig file: {e}", err=True)
         sys.exit(2)
 
     # Reconstruct public key for verification
+    # C3 fix: warn loudly when using embedded key (no independent trust verification)
+    using_trusted_key = False
     try:
         if pubkey_path is not None:
             pub_key = load_public_key(Path(pubkey_path))
+            using_trusted_key = True
         else:
-            # Use embedded public key from sig file
-            raw_pub = base64.b64decode(sig.public_key)
-            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-            from cryptography.hazmat.primitives import serialization
-            pub_key = Ed25519PublicKey.from_public_bytes(raw_pub)
+            # Check keyring for matching key
+            keyring_dir = DEFAULT_KEY_DIR / "keyring"
+            trusted_keys = keyring_list(keyring_dir)
+            matched_trust = None
+            for entry in trusted_keys:
+                if entry["fingerprint"] == sig.key_fingerprint:
+                    pub_key = load_public_key(Path(entry["path"]))
+                    using_trusted_key = True
+                    matched_trust = entry["alias"]
+                    break
+
+            if not using_trusted_key:
+                # Fall back to embedded key — but WARN the user
+                raw_pub = base64.b64decode(sig.public_key)
+                from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+                pub_key = Ed25519PublicKey.from_public_bytes(raw_pub)
     except Exception as e:
         if not quiet:
             click.echo(f"Error loading public key: {e}", err=True)
@@ -273,7 +291,20 @@ def verify(model_path, sig_path, pubkey_path, output_json, quiet):
             click.echo(f"Error hashing model: {e}", err=True)
         sys.exit(2)
 
-    # Rebuild message and verify
+    # C1 fix: check file hash against sig BEFORE verifying signature
+    # sig.sha256 is stored as "sha256:<hex>", model_hash is raw hex
+    expected_hash = sig.sha256
+    if expected_hash.startswith("sha256:"):
+        expected_hash = expected_hash[7:]
+    if model_hash != expected_hash:
+        if output_json:
+            click.echo(json.dumps({"verified": False, "error": "hash mismatch",
+                                   "detail": "file has been modified since signing"}))
+        elif not quiet:
+            click.echo(f"FAILED {model_path.name}\n  Hash mismatch — file has been modified since signing.")
+        sys.exit(1)
+
+    # Rebuild message and verify signature
     identity_bytes = canonical_json(sig.identity)
     if model_path.is_dir():
         message = build_dir_message(model_hash, identity_bytes)
@@ -289,33 +320,53 @@ def verify(model_path, sig_path, pubkey_path, output_json, quiet):
 
     ok = verify_bytes(message, signature_bytes, pub_key)
 
+    if not ok:
+        if output_json:
+            click.echo(json.dumps({"verified": False, "error": "invalid signature",
+                                   "detail": "signature or identity card has been tampered with"}))
+        elif not quiet:
+            click.echo(f"FAILED {model_path.name}\n  Invalid signature — sig file may have been tampered with.")
+        sys.exit(1)
+
+    # Determine trust level for display
+    fp = compute_fingerprint(pub_key)
+    if pubkey_path:
+        trust_label = "TRUSTED (--pubkey)"
+    elif using_trusted_key:
+        trust_label = f"TRUSTED (keyring: {matched_trust})"
+    else:
+        trust_label = "UNVERIFIED — using embedded key, not independently trusted"
+
     if output_json:
         result = {
-            "verified": ok,
+            "verified": True,
             "model": str(model_path),
             "sha256": f"sha256:{model_hash}",
-            "fingerprint": sig.key_fingerprint,
+            "fingerprint": fp,
+            "trust": trust_label,
             "signed_at": sig.signed_at,
             "identity": sig.identity,
         }
         click.echo(json.dumps(result))
-        if not ok:
-            sys.exit(1)
         return
 
     if quiet:
-        if not ok:
-            sys.exit(1)
         return
 
-    if ok:
-        click.echo(f"VERIFIED: {model_path}")
-        click.echo(f"  Identity: {sig.identity.get('name', '(unnamed)')}")
-        click.echo(f"  Fingerprint: {sig.key_fingerprint}")
-        click.echo(f"  Signed at: {sig.signed_at} (unverified — no RFC 3161 timestamp)")
-    else:
-        click.echo(f"FAILED: signature verification failed for {model_path}")
-        sys.exit(1)
+    click.echo(f"VERIFIED {model_path.name}")
+    click.echo(f"  Name:         {sig.identity.get('name', '(unnamed)')}")
+    if sig.identity.get("creator"):
+        click.echo(f"  Creator:      {sig.identity['creator']}")
+    if sig.identity.get("architecture"):
+        click.echo(f"  Architecture: {sig.identity['architecture']}")
+    if sig.identity.get("base_model"):
+        click.echo(f"  Base model:   {sig.identity['base_model']}")
+    if sig.identity.get("license"):
+        click.echo(f"  License:      {sig.identity['license']}")
+    click.echo(f"  Signed:       {sig.signed_at} (unverified — no RFC 3161 timestamp)")
+    click.echo(f"  Key:          {fp} ({trust_label})")
+    if not using_trusted_key:
+        click.echo(f"  WARNING: key not in keyring. Run 'modelsign keyring add <pubkey> <alias>' to trust it.")
 
 
 @main.command()
