@@ -1,6 +1,6 @@
 """modelsign — Sign AI models with identity. Verify anywhere."""
 
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 
 from modelsign.identity.card import ModelCard, validate_card
 from modelsign.identity.canonical import canonical_json
