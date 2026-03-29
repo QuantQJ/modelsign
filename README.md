@@ -4,9 +4,11 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 
-Sign AI models with identity. Verify anywhere.
+Sign AI models with identity. Verify anywhere. Part of the **[AURE Provenance](https://constantsystems.ai/provenance)** stack by [Constant Systems](https://constantsystems.ai).
 
-`modelsign` cryptographically binds model files to a signed identity card -- who made this model, what it's based on, what it claims to be. Ed25519 signatures, zero ML dependencies, works with any model format.
+`modelsign` cryptographically binds model files to a signed identity card — who made this model, what it's based on, what it claims to be. Ed25519 signatures, zero ML dependencies, works with any model format.
+
+> **Note:** `modelsign` is distinct from the OpenSSF `model-signing` package on PyPI. We are an independent implementation using Ed25519 + RFC 8785 canonical JSON. Designed and maintained by James Kerr / Constant Systems.
 
 ## Install
 

@@ -5,8 +5,8 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "modelsign"
 version = "1.0.3"
-description = "Sign AI models with identity. Verify anywhere."
-authors = [{name = "QJ", email = "qj@constantone.ai"}]
+description = "Sign AI models with identity. Verify anywhere. Part of the AURE Provenance stack by Constant Systems."
+authors = [{name = "James Kerr", email = "qj@constantqj.com"}]
 license = {text = "Apache-2.0"}
 requires-python = ">=3.9"
 readme = "README.md"
@@ -32,8 +32,10 @@ dev = ["pytest>=7.0", "pytest-cov", "mypy"]
 modelsign = "modelsign.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/ConstantQJ/modelsign"
-Issues = "https://github.com/ConstantQJ/modelsign/issues"
+Homepage = "https://constantsystems.ai/provenance"
+Repository = "https://github.com/QuantQJ/modelsign"
+Issues = "https://github.com/QuantQJ/modelsign/issues"
+Documentation = "https://constantsystems.ai/provenance"
 
 [tool.setuptools.packages.find]
 where = ["src"]
