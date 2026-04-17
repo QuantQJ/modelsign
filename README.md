@@ -3,6 +3,8 @@
 [![CI](https://github.com/QuantQJ/modelsign/actions/workflows/ci.yml/badge.svg)](https://github.com/QuantQJ/modelsign/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-%E2%98%95-FFDD00?logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/qjkerr1)
+[![GitHub Sponsors](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ea4aaa?logo=github)](https://github.com/sponsors/QuantQJ)
 
 Sign AI models with identity. Verify anywhere. Part of the **[AURE Provenance](https://constantsystems.ai/provenance)** stack by [Constant Systems](https://constantsystems.ai).
 
