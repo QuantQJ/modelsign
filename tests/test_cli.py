@@ -277,3 +277,70 @@ def test_verify_forged_sig_fails(tmp_path):
     ])
     assert result.exit_code != 0
     assert "FAILED" in result.output
+
+
+def test_oms_keygen_export_and_verify(tmp_path):
+    """The OMS subcommands work end to end on a model directory."""
+    from click.testing import CliRunner
+
+    from modelsign.cli import main
+
+    runner = CliRunner()
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "model.safetensors").write_bytes(b"weights")
+    (model / "config.json").write_bytes(b'{"model_type":"llama"}')
+
+    keys = runner.invoke(main, ["oms", "keygen", "--dir", str(tmp_path / "keys")])
+    assert keys.exit_code == 0
+    priv = tmp_path / "keys" / "oms_private.pem"
+    pub = tmp_path / "keys" / "oms_public.pem"
+
+    exported = runner.invoke(
+        main,
+        ["oms", "export", str(model), "--key", str(priv), "--out", str(model / "model.sig")],
+    )
+    assert exported.exit_code == 0
+    assert "OpenSSF Model Signing" in exported.output
+
+    verified = runner.invoke(main, ["oms", "verify", str(model), "--pubkey", str(pub)])
+    assert verified.exit_code == 0
+    assert "VERIFIED" in verified.output
+
+
+def test_oms_verify_fails_on_tampered_model(tmp_path):
+    from click.testing import CliRunner
+
+    from modelsign.cli import main
+
+    runner = CliRunner()
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "model.safetensors").write_bytes(b"weights")
+
+    runner.invoke(main, ["oms", "keygen", "--dir", str(tmp_path / "keys")])
+    priv = tmp_path / "keys" / "oms_private.pem"
+    pub = tmp_path / "keys" / "oms_public.pem"
+    runner.invoke(
+        main,
+        ["oms", "export", str(model), "--key", str(priv), "--out", str(model / "model.sig")],
+    )
+    (model / "model.safetensors").write_bytes(b"swapped")
+
+    result = runner.invoke(main, ["oms", "verify", str(model), "--pubkey", str(pub)])
+    assert result.exit_code == 1
+    assert "FAILED" in result.output
+
+
+def test_oms_export_rejects_ed25519_key(tmp_path, tmp_keypair):
+    from click.testing import CliRunner
+
+    from modelsign.cli import main
+
+    model = tmp_path / "m.safetensors"
+    model.write_bytes(b"weights")
+    result = CliRunner().invoke(
+        main, ["oms", "export", str(model), "--key", str(tmp_keypair["private"])]
+    )
+    assert result.exit_code == 1
+    assert "ECDSA" in result.output
