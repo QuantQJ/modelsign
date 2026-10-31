@@ -1,6 +1,7 @@
 """Tests for approval countersignatures."""
 
 import json
+import string
 
 import pytest
 from cryptography.hazmat.primitives import serialization
@@ -14,6 +15,21 @@ from modelsign.approvals import (
     require_approval,
 )
 from modelsign.sig import read_sig, write_sig
+
+
+B64_ALPHABET = string.ascii_uppercase + string.ascii_lowercase + string.digits + "+/"
+
+
+def non_canonical(encoded: str) -> str:
+    """Re-encode a 32-byte key's base64 with an unused bit flipped.
+
+    32 bytes encode to 43 data characters plus one "=": the last data
+    character carries 4 bits of key and 2 bits that mean nothing, so flipping
+    one always yields a different string that decodes to the same key. This is
+    computed rather than searched for, so the test can never skip itself.
+    """
+    index = B64_ALPHABET.index(encoded[-2])
+    return encoded[:-2] + B64_ALPHABET[index ^ 1] + "="
 
 
 @pytest.fixture
@@ -344,25 +360,17 @@ def test_one_key_cannot_pad_a_quorum_with_re_encodings(signed, approver, tmp_pat
     approver satisfy a four-person quorum.
     """
     import base64
-    import string
 
     approve(signed, key=approver["private"], role="build")
     sig_path = default_sig_path(signed)
     data = json.loads(sig_path.read_text())
     record = data["approvals"][0]
     canonical = record["public_key"]
-    raw = base64.b64decode(canonical)
+    variant = non_canonical(canonical)
+    assert variant != canonical
+    assert base64.b64decode(variant, validate=True) == base64.b64decode(canonical)
 
-    alphabet = string.ascii_uppercase + string.ascii_lowercase + string.digits + "+/"
-    variants = [
-        canonical[:-2] + ch + "="
-        for ch in alphabet
-        if canonical[:-2] + ch + "=" != canonical
-        and base64.b64decode(canonical[:-2] + ch + "=", validate=True) == raw
-    ]
-    assert variants, "expected non-canonical encodings of the same key to exist"
-
-    for position, variant in enumerate(variants, start=1):
+    for position in (1, 2, 3):
         clone = dict(record)
         clone["public_key"] = variant
         clone["role"] = f"role-{position}"
@@ -377,21 +385,12 @@ def test_one_key_cannot_pad_a_quorum_with_re_encodings(signed, approver, tmp_pat
 
 
 def test_a_non_canonical_key_encoding_is_refused(signed, approver):
-    import base64
-
     approve(signed, key=approver["private"], role="build")
     sig_path = default_sig_path(signed)
     data = json.loads(sig_path.read_text())
-    canonical = data["approvals"][0]["public_key"]
-    raw = base64.b64decode(canonical)
-    for ch in "ABCDEFGHIJKLMNOP":
-        candidate = canonical[:-2] + ch + "="
-        if candidate != canonical and base64.b64decode(candidate, validate=True) == raw:
-            data["approvals"][0]["public_key"] = candidate
-            break
-    else:
-        pytest.skip("no non-canonical encoding available for this key")
-
+    data["approvals"][0]["public_key"] = non_canonical(
+        data["approvals"][0]["public_key"]
+    )
     sig_path.write_text(json.dumps(data))
     assert read_approvals(sig_path, pubkeys=[approver["public"]])[0].valid is False
 
