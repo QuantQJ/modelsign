@@ -1,5 +1,6 @@
 """Sig file I/O — reading, writing, and version management for .sig files."""
 
+import hashlib
 import json
 import sys
 from dataclasses import dataclass, asdict
@@ -116,3 +117,22 @@ def _check_fingerprint(sig: SigFile) -> None:
         if "fingerprint mismatch" in str(e):
             raise
         raise ValueError(f"fingerprint validation failed: {e}")
+
+
+def sig_digest(sig: "SigFile | Path | str") -> str:
+    """The digest a derived model records as its ``parent_signature``.
+
+    Taken over the signature's canonical JSON rather than the file's bytes, so
+    reformatting a .sig does not break a chain that points at it.
+    """
+    from modelsign.identity.canonical import canonical_json
+
+    if not isinstance(sig, SigFile):
+        sig = read_sig(Path(sig))
+    payload = {
+        "signature": sig.signature,
+        "sha256": sig.sha256,
+        "key_fingerprint": sig.key_fingerprint,
+        "identity": sig.identity,
+    }
+    return "sha256:" + hashlib.sha256(canonical_json(payload)).hexdigest()

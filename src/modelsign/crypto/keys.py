@@ -47,16 +47,18 @@ def generate_keypair(key_dir: Path) -> tuple[Path, Path]:
 
 
 def load_private_key(path: Path) -> Ed25519PrivateKey:
-    """Load Ed25519 private key from PEM file."""
-    key = serialization.load_pem_private_key(Path(path).read_bytes(), password=None)
+    """Load Ed25519 private key from PEM file. ``~`` is expanded."""
+    key = serialization.load_pem_private_key(
+        Path(path).expanduser().read_bytes(), password=None
+    )
     if not isinstance(key, Ed25519PrivateKey):
         raise ValueError(f"Expected Ed25519 private key, got {type(key).__name__}")
     return key
 
 
 def load_public_key(path: Path) -> Ed25519PublicKey:
-    """Load Ed25519 public key from PEM file."""
-    key = serialization.load_pem_public_key(Path(path).read_bytes())
+    """Load Ed25519 public key from PEM file. ``~`` is expanded."""
+    key = serialization.load_pem_public_key(Path(path).expanduser().read_bytes())
     if not isinstance(key, Ed25519PublicKey):
         raise ValueError(f"Expected Ed25519 public key, got {type(key).__name__}")
     return key
@@ -89,19 +91,28 @@ def keyring_add(keyring_dir: Path, pubkey_path: Path, alias: str) -> None:
 
 
 def keyring_list(keyring_dir: Path) -> list[dict]:
-    """List all trusted keys with alias and fingerprint."""
+    """List trusted keys in the keyring.
+
+    An entry that will not load is skipped rather than fatal: the keyring is a
+    directory anyone can drop a file into, and one unreadable or non-Ed25519
+    key must not stop every model from verifying.
+    """
     keyring_dir = Path(keyring_dir)
     if not keyring_dir.exists():
         return []
-    result = []
-    for pem_file in sorted(keyring_dir.glob("*.pem")):
-        key = load_public_key(pem_file)
-        result.append({
-            "alias": pem_file.stem,
+
+    entries = []
+    for pem in sorted(keyring_dir.glob("*.pem")):
+        try:
+            key = load_public_key(pem)
+        except Exception:
+            continue
+        entries.append({
+            "alias": pem.stem,
+            "path": str(pem),
             "fingerprint": compute_fingerprint(key),
-            "path": str(pem_file),
         })
-    return result
+    return entries
 
 
 def keyring_remove(keyring_dir: Path, alias: str) -> None:

@@ -22,6 +22,11 @@ from typing import Any, Callable, Optional
 from modelsign.api import VerifyError, VerifyResult, default_sig_path, verify_model
 from modelsign.oms import DEFAULT_BUNDLE_NAME, OMSError, verify_bundle
 
+#: Conventional name for a directory signature published inside a repository,
+#: alongside OMS's ``model.sig``. ``<dir>.sig`` beside the tree also works,
+#: but a Hub download never writes outside the snapshot directory.
+DIR_SIG_NAME = "modelsign.sig"
+
 __all__ = ["LoadBlocked", "require_verified", "install", "uninstall", "is_installed"]
 
 
@@ -145,18 +150,23 @@ class _HubGuard:
             local = Path(original(*args, **kwargs))
 
             # A directory signature is the strong form: its manifest covers
-            # every file, so an added or swapped file breaks the hash.
-            whole = default_sig_path(local)
-            if whole.exists():
-                self._check(local, whole)
-                return str(local)
+            # every relative path, so an added or swapped file breaks it. It
+            # may sit beside the tree or, for a published repo, inside it.
+            for candidate in (default_sig_path(local), local / DIR_SIG_NAME):
+                if candidate.exists():
+                    self._check(local, candidate)
+                    return str(local)
 
             # An OMS bundle covers the whole repo the same way, so honour it
             # wherever the deployment has told us which key to trust.
-            oms_bundle = local / DEFAULT_BUNDLE_NAME
-            if oms_bundle.exists() and self.policy.get("oms_pubkey"):
-                self._check_oms(local, oms_bundle)
-                return str(local)
+            if self.policy.get("oms_pubkey"):
+                for bundle in (
+                    local / DEFAULT_BUNDLE_NAME,
+                    local.parent / DEFAULT_BUNDLE_NAME,
+                ):
+                    if bundle.exists():
+                        self._check_oms(local, bundle)
+                        return str(local)
 
             # Per-file signatures do not bind a file to its place in the
             # repository, so a snapshot needs a signature over the whole
@@ -164,33 +174,25 @@ class _HubGuard:
             if not self.policy.get("allow_per_file", False):
                 raise LoadBlocked(
                     f"refused {local.name}: no directory signature "
-                    f"({local.name}.sig) or OMS bundle ({DEFAULT_BUNDLE_NAME}). "
-                    "Per-file signatures do not bind a file to its path; sign "
-                    "the directory, or pass allow_per_file=True."
+                    f"({local.name}.sig or {DIR_SIG_NAME}) and no OMS bundle "
+                    f"({DEFAULT_BUNDLE_NAME}). Per-file signatures do not bind "
+                    "a file to its path; sign the directory, or pass "
+                    "allow_per_file=True."
                 )
 
-            # Falling back to per-file signatures, every file must carry one.
-            # Verifying only the files that happen to be signed would let an
-            # unsigned file ride along beside a signed one.
             files = [
                 f for f in local.rglob("*") if f.is_file() and f.suffix != ".sig"
             ]
-            unsigned = [f for f in files if not default_sig_path(f).exists()]
-            if unsigned:
-                self._unsigned(local, unsigned)
-                return str(local)
 
-            # A single-file signature authenticates the basename, not the path
-            # it sits at, so two files sharing a basename in different
-            # directories could be swapped for each other. A directory
-            # signature has no such gap; refuse the ambiguity instead.
+            # Basename ambiguity is about paths, not about missing signatures,
+            # so it is refused regardless of the unsigned-file policy.
             by_basename: dict[str, list[Path]] = {}
             for f in files:
                 by_basename.setdefault(f.name, []).append(f)
             clashes = {
                 name: paths for name, paths in by_basename.items() if len(paths) > 1
             }
-            if clashes and not self.allow_unsigned:
+            if clashes:
                 detail = "; ".join(
                     f"{name} at " + ", ".join(
                         sorted(p.relative_to(local).as_posix() for p in paths)
@@ -203,8 +205,16 @@ class _HubGuard:
                     "directory instead, which covers every relative path."
                 )
 
-            for f in files:
+            # Every signature present is checked, whatever the policy on files
+            # that have none — otherwise allow_unsigned would also wave through
+            # a tampered file that *is* signed.
+            signed = [f for f in files if default_sig_path(f).exists()]
+            for f in signed:
                 self._check(f, default_sig_path(f))
+
+            unsigned = [f for f in files if not default_sig_path(f).exists()]
+            if unsigned:
+                self._unsigned(local, unsigned)
             return str(local)
 
         return guarded
@@ -244,7 +254,7 @@ class _HubGuard:
             "snapshot_download": self._wrap_snapshot,
         }
 
-        guarded_by_original = {}
+        replacements: list[tuple[Callable, Callable]] = []
         for name, wrapper in wrappers.items():
             original = getattr(huggingface_hub, name, None)
             if original is None or getattr(original, "_modelsign_guarded", False):
@@ -253,24 +263,27 @@ class _HubGuard:
             guarded._modelsign_guarded = True  # type: ignore[attr-defined]
             guarded.__name__ = getattr(original, "__name__", name)
             guarded.__doc__ = getattr(original, "__doc__", None)
-            guarded_by_original[original] = (name, guarded)
+            replacements.append((original, guarded))
 
-        if not guarded_by_original:
+        if not replacements:
             return
 
+        # Compared with `is` rather than looked up in a dict: an arbitrary
+        # module attribute may be unhashable, and a TypeError here would abort
+        # the sweep with some modules already patched and no way to undo them.
         for module in list(sys.modules.values()):
-            if module is None:
+            if module is None or not hasattr(module, "__dict__"):
                 continue
-            for attr, value in list(vars(module).items()) if hasattr(module, "__dict__") else []:
-                match = guarded_by_original.get(value) if callable(value) else None
-                if match is None:
-                    continue
-                _, guarded = match
-                try:
-                    setattr(module, attr, guarded)
-                except Exception:
-                    continue
-                self._patches.append((module, attr, value))
+            for attr, value in list(vars(module).items()):
+                for original, guarded in replacements:
+                    if value is not original:
+                        continue
+                    try:
+                        setattr(module, attr, guarded)
+                    except Exception:
+                        break
+                    self._patches.append((module, attr, value))
+                    break
 
     def remove(self) -> None:
         for module, attr, original in reversed(self._patches):
@@ -300,8 +313,23 @@ def install(
     can set the trusted key without touching code.
     """
     global _active
+    policy = {
+        "pubkey": pubkey,
+        "oms_pubkey": oms_pubkey,
+        "keyring_dir": keyring_dir,
+        "allow_embedded": allow_embedded,
+        "allow_unsigned": allow_unsigned,
+        "allow_unbound_names": allow_unbound_names,
+        "allow_per_file": allow_per_file,
+    }
     if _active is not None:
-        return
+        if {k: _active.policy.get(k) for k in policy} == policy:
+            return
+        raise RuntimeError(
+            "modelsign.guard is already installed with a different policy. "
+            "Call uninstall() first — silently keeping the earlier policy "
+            "would leave a caller believing its own, stricter one was in force."
+        )
 
     if pubkey is None:
         pubkey = os.environ.get("MODELSIGN_PUBKEY") or None

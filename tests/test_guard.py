@@ -455,3 +455,117 @@ def test_per_file_signatures_are_refused_by_default(fake_hub, tmp_keypair):
     message = str(excinfo.value)
     assert "no directory signature" in message
     assert "allow_per_file=True" in message
+
+
+# -- review findings: the guard must not hand back unverified weights
+
+
+def test_allow_unsigned_still_verifies_the_files_that_are_signed(
+    fake_hub, tmp_keypair
+):
+    """allow_unsigned is about files with no signature, not a blanket pass.
+
+    An earlier version returned as soon as it saw one unsigned file, skipping
+    the digest check on the signed weights beside it.
+    """
+    signed = _publish(fake_hub, tmp_keypair, name="model.safetensors")
+    _publish(fake_hub, tmp_keypair, name="README.md", sign=False)
+    signed.write_bytes(b"BACKDOORED-AFTER-SIGNING")
+
+    guard.install(
+        pubkey=tmp_keypair["public"], allow_unsigned=True, allow_per_file=True
+    )
+    with pytest.raises(guard.LoadBlocked) as excinfo:
+        fake_hub.module.snapshot_download("acme/model")
+    assert "hash mismatch" in str(excinfo.value)
+
+
+def test_basename_clash_is_refused_even_with_allow_unsigned(fake_hub, tmp_keypair):
+    """Path ambiguity is not a question about missing signatures."""
+    from modelsign.api import sign_model
+
+    _publish(fake_hub, tmp_keypair, name="model.safetensors")
+    nested = fake_hub.repo / "onnx"
+    nested.mkdir()
+    target = nested / "model.safetensors"
+    target.write_bytes(b"different-weights")
+    sign_model(target, name="Published-Model", key=tmp_keypair["private"])
+
+    guard.install(
+        pubkey=tmp_keypair["public"], allow_unsigned=True, allow_per_file=True
+    )
+    with pytest.raises(guard.LoadBlocked) as excinfo:
+        fake_hub.module.snapshot_download("acme/model")
+    assert "basename only" in str(excinfo.value)
+
+
+def test_a_directory_signature_inside_the_repo_is_honoured(fake_hub, tmp_keypair):
+    """A Hub download never writes outside the snapshot, so <dir>.sig is unreachable."""
+    from modelsign.api import sign_model
+
+    (fake_hub.repo / "model.safetensors").write_bytes(b"weights")
+    (fake_hub.repo / "config.json").write_bytes(b'{"model_type":"llama"}')
+    sign_model(
+        fake_hub.repo,
+        name="Published-Repo",
+        key=tmp_keypair["private"],
+        sig_path=fake_hub.repo / guard.DIR_SIG_NAME,
+    )
+    guard.install(pubkey=tmp_keypair["public"])
+    assert fake_hub.module.snapshot_download("acme/model")
+
+
+def test_in_repo_directory_signature_catches_a_smuggled_file(fake_hub, tmp_keypair):
+    from modelsign.api import sign_model
+
+    (fake_hub.repo / "model.safetensors").write_bytes(b"weights")
+    sign_model(
+        fake_hub.repo,
+        name="Published-Repo",
+        key=tmp_keypair["private"],
+        sig_path=fake_hub.repo / guard.DIR_SIG_NAME,
+    )
+    (fake_hub.repo / "smuggled.pkl").write_bytes(b"added after signing")
+    guard.install(pubkey=tmp_keypair["public"])
+    with pytest.raises(guard.LoadBlocked):
+        fake_hub.module.snapshot_download("acme/model")
+
+
+def test_a_malformed_sig_raises_load_blocked_not_a_raw_exception(
+    fake_hub, tmp_keypair, tmp_path
+):
+    """Whatever an attacker puts in a .sig, the loader sees LoadBlocked."""
+    import json
+
+    from modelsign.api import default_sig_path, sign_model
+
+    model = tmp_path / "model.safetensors"
+    model.write_bytes(b"weights")
+    sign_model(model, name="Test", key=tmp_keypair["private"])
+    sig_path = default_sig_path(model)
+
+    for mutate in (
+        lambda d: d.update({"modelsign_version": "9.0"}),
+        lambda d: d.pop("identity"),
+        lambda d: d.update({"public_key": "###not-base64###"}),
+        lambda d: d.update({"signature": None}),
+    ):
+        data = json.loads(sig_path.read_text())
+        mutate(data)
+        sig_path.write_text(json.dumps(data))
+        with pytest.raises(guard.LoadBlocked):
+            guard.require_verified(model, pubkey=tmp_keypair["public"])
+
+
+def test_installing_a_second_different_policy_is_refused(fake_hub, tmp_keypair):
+    """Silently keeping the first policy would mislead the stricter caller."""
+    guard.install(pubkey=tmp_keypair["public"], allow_unsigned=True)
+    with pytest.raises(RuntimeError) as excinfo:
+        guard.install(pubkey=tmp_keypair["public"])
+    assert "different policy" in str(excinfo.value)
+
+
+def test_installing_the_same_policy_twice_is_fine(fake_hub, tmp_keypair):
+    guard.install(pubkey=tmp_keypair["public"], allow_per_file=True)
+    guard.install(pubkey=tmp_keypair["public"], allow_per_file=True)
+    assert guard.is_installed()

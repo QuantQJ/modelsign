@@ -1,5 +1,7 @@
 """Tests for the library-level sign/verify API."""
 
+from pathlib import Path
+
 import pytest
 
 from modelsign.api import (
@@ -38,7 +40,10 @@ def test_verify_roundtrip_is_trusted_with_pubkey(signed_file, tmp_keypair):
 
 
 def test_embedded_key_verifies_but_is_not_trusted(signed_file, tmp_path):
-    result = verify_model(signed_file, keyring_dir=tmp_path / "empty-keyring")
+    # require_trusted is on by default now, so integrity-only is explicit.
+    result = verify_model(
+        signed_file, keyring_dir=tmp_path / "empty-keyring", require_trusted=False
+    )
     assert result.verified is True
     assert result.trust == TRUST_EMBEDDED
     assert result.trusted is False
@@ -248,4 +253,114 @@ def test_directory_signatures_are_bound_by_their_manifest(tmp_keypair, tmp_model
 
     result = verify_model(elsewhere, pubkey=tmp_keypair["public"])
     assert result.verified
+    # A directory's own name is not signed; its layout is.
+    assert result.name_bound is False
+    assert result.paths_bound is True
+
+
+def test_embedded_key_is_not_verified_by_default(signed_file, tmp_path):
+    """Anyone can generate a key, so an embedded-only signature is not enough."""
+    result = verify_model(signed_file, keyring_dir=tmp_path / "empty-keyring")
+    assert not result
+    assert result.error == "untrusted key"
+
+
+def test_single_file_reports_name_bound_not_paths_bound(signed_file, tmp_keypair):
+    result = verify_model(signed_file, pubkey=tmp_keypair["public"])
     assert result.name_bound is True
+    assert result.paths_bound is False
+
+
+def test_unsupported_sig_version_is_a_failed_check_not_an_exception(
+    signed_file, tmp_keypair
+):
+    import json
+
+    path = default_sig_path(signed_file)
+    data = json.loads(path.read_text())
+    data["modelsign_version"] = "9.0"
+    path.write_text(json.dumps(data))
+
+    result = verify_model(signed_file, pubkey=tmp_keypair["public"])
+    assert not result
+    assert result.error == "malformed sig"
+
+
+def test_missing_sig_field_is_a_failed_check(signed_file, tmp_keypair):
+    import json
+
+    path = default_sig_path(signed_file)
+    data = json.loads(path.read_text())
+    del data["identity"]
+    path.write_text(json.dumps(data))
+
+    result = verify_model(signed_file, pubkey=tmp_keypair["public"])
+    assert not result
+    assert result.error == "malformed sig"
+
+
+def test_unusable_embedded_key_is_a_failed_check(signed_file, tmp_path):
+    """A public_key that is not 32 bytes must not escape as a ValueError."""
+    import base64
+    import hashlib
+    import json
+
+    from modelsign.crypto.keys import FINGERPRINT_HEX_CHARS
+
+    path = default_sig_path(signed_file)
+    data = json.loads(path.read_text())
+    raw = b"too-short"
+    data["public_key"] = base64.b64encode(raw).decode()
+    data["key_fingerprint"] = (
+        "ed25519:" + hashlib.sha256(raw).hexdigest()[:FINGERPRINT_HEX_CHARS]
+    )
+    path.write_text(json.dumps(data))
+
+    result = verify_model(signed_file, keyring_dir=tmp_path / "empty")
+    assert not result
+    assert result.error == "malformed sig"
+
+
+def test_caller_supplied_key_that_cannot_load_is_a_usage_error(signed_file, tmp_path):
+    with pytest.raises(VerifyError):
+        verify_model(signed_file, pubkey=tmp_path / "does-not-exist.pem")
+
+
+def test_tilde_paths_are_expanded(tmp_path, monkeypatch, tmp_keypair):
+    """The documented pubkey="~/keys/vendor.pem" form has to actually work."""
+    home = tmp_path / "home"
+    (home / "keys").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: home)
+
+    key_copy = home / "keys" / "vendor.pem"
+    key_copy.write_bytes(tmp_keypair["public"].read_bytes())
+
+    model = tmp_path / "model.safetensors"
+    model.write_bytes(b"weights")
+    sign_model(model, name="Tilde", key=tmp_keypair["private"])
+
+    assert verify_model(model, pubkey="~/keys/vendor.pem")
+
+
+def test_a_bad_key_in_the_keyring_does_not_break_verification(
+    signed_file, tmp_keypair, tmp_path
+):
+    """The keyring is a directory; one unreadable entry must not be fatal."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    keyring = tmp_path / "keyring"
+    keyring.mkdir()
+    (keyring / "broken.pem").write_bytes(b"not a key at all")
+    (keyring / "wrong-type.pem").write_bytes(
+        ec.generate_private_key(ec.SECP256R1()).public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    )
+    (keyring / "vendor.pem").write_bytes(tmp_keypair["public"].read_bytes())
+
+    result = verify_model(signed_file, keyring_dir=keyring)
+    assert result
+    assert result.trusted_alias == "vendor"

@@ -120,7 +120,13 @@ def _find_pubkey_for_private(priv_path: Path) -> Path:
 @click.option("--identity", "identity_file", default=None, help="Path to JSON identity card file.")
 @click.option("--key", "key_path", default=None, help="Path to private key PEM file.")
 @click.option("--out", "out_path", default=None, help="Output .sig file path (default: MODEL.sig).")
-def sign(model_path, name, identity_file, key_path, out_path):
+@click.option(
+    "--parent",
+    "parent_sig",
+    default=None,
+    help="Signature of the model this was derived from; recorded as parent_signature.",
+)
+def sign(model_path, name, identity_file, key_path, out_path, parent_sig):
     """Sign a model file or directory."""
     model_path = Path(model_path)
 
@@ -138,8 +144,19 @@ def sign(model_path, name, identity_file, key_path, out_path):
     sig_path = Path(out_path) if out_path else default_sig_path(model_path)
 
     try:
-        sig = sign_model(model_path, card=card, name=name, key=key_path, sig_path=sig_path)
+        sig = sign_model(
+            model_path,
+            card=card,
+            name=name,
+            key=key_path,
+            sig_path=sig_path,
+            parent=parent_sig,
+        )
+    except VerifyError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
     except ValueError as e:
+        # Only validate_card raises ValueError now; key problems are VerifyError.
         click.echo(f"Error: invalid identity card: {e}", err=True)
         sys.exit(1)
     except Exception as e:
@@ -150,6 +167,8 @@ def sign(model_path, name, identity_file, key_path, out_path):
     click.echo(f"Sig file:    {sig_path}")
     click.echo(f"Fingerprint: {sig.key_fingerprint}")
     click.echo(f"SHA-256:     {sig.sha256[:23]}...")
+    if sig.identity.get("parent_signature"):
+        click.echo(f"Parent:      {sig.identity['parent_signature'][:23]}...")
 
 
 _TRUST_LABELS = {
@@ -173,7 +192,13 @@ _FAILURE_LINES = {
     "--require-trusted",
     is_flag=True,
     default=False,
-    help="Fail unless the signing key is in the keyring or given with --pubkey.",
+    help="Kept for compatibility; requiring a trusted key is now the default.",
+)
+@click.option(
+    "--allow-embedded-key",
+    is_flag=True,
+    default=False,
+    help="Accept a signature checkable only against its own key: integrity, not identity.",
 )
 @click.option(
     "--allow-unbound-name",
@@ -183,7 +208,7 @@ _FAILURE_LINES = {
 )
 def verify(
     model_path, sig_path, pubkey_path, output_json, quiet, require_trusted,
-    allow_unbound_name,
+    allow_embedded_key, allow_unbound_name,
 ):
     """Verify a signed model file or directory."""
     model_path = Path(model_path)
@@ -193,7 +218,7 @@ def verify(
             model_path,
             sig_path=sig_path,
             pubkey=pubkey_path,
-            require_trusted=require_trusted,
+            require_trusted=not allow_embedded_key,
             require_name_binding=not allow_unbound_name,
         )
     except VerifyError as e:
@@ -425,5 +450,77 @@ def oms_verify(model_path, bundle_path, pubkey_path, output_json, quiet):
             click.echo(f"  Digest:  {result.sha256}")
         else:
             click.echo(f"FAILED {model_path.name}\n  {result.error}: {result.detail}")
+
+    sys.exit(0 if result.verified else 1)
+
+
+@main.command()
+@click.argument("model_path")
+@click.option("--sig", "sig_path", default=None, help="Path to .sig file (default: MODEL.sig).")
+@click.option(
+    "--search",
+    multiple=True,
+    help="Directory (or .sig file) to search for ancestor signatures. Repeatable.",
+)
+@click.option("--pubkey", "pubkey_path", default=None, help="Trusted public key PEM.")
+@click.option(
+    "--require-complete",
+    is_flag=True,
+    default=False,
+    help="Fail unless the chain reaches a model that records no parent.",
+)
+@click.option("--json", "output_json", is_flag=True, default=False, help="Output JSON.")
+def lineage(model_path, sig_path, search, pubkey_path, require_complete, output_json):
+    """Walk a model's provenance chain back through its ancestors."""
+    from modelsign.lineage import verify_lineage
+
+    result = verify_lineage(
+        model_path,
+        sig_path=sig_path,
+        search=search,
+        pubkey=pubkey_path,
+        require_complete=require_complete,
+    )
+
+    if output_json:
+        click.echo(json.dumps({
+            "verified": result.verified,
+            "complete": result.complete,
+            "depth": result.depth,
+            "error": result.error,
+            "chain": [
+                {
+                    "depth": link.depth,
+                    "name": link.name,
+                    "digest": link.digest,
+                    "sig": str(link.sig_path) if link.sig_path else None,
+                    "signature_valid": link.signature_valid,
+                    "bytes_verified": link.bytes_verified,
+                    "key": link.key_fingerprint,
+                    "error": link.error,
+                }
+                for link in result.chain
+            ],
+        }))
+        sys.exit(0 if result.verified else 1)
+
+    header = "LINEAGE VERIFIED" if result.verified else "LINEAGE FAILED"
+    click.echo(f"{header} {Path(model_path).name}  ({result.depth} link(s))")
+    for link in result.chain:
+        mark = "ok " if link.ok else "BAD"
+        indent = "  " + ("  " * link.depth)
+        label = link.name or "(unnamed)"
+        click.echo(f"{indent}[{mark}] {label}")
+        if link.digest:
+            click.echo(f"{indent}      sig {link.digest[:23]}...")
+        if link.key_fingerprint:
+            scope = "bytes + signature" if link.bytes_verified else "signature only"
+            click.echo(f"{indent}      key {link.key_fingerprint} ({scope})")
+        if link.error:
+            click.echo(f"{indent}      {link.error}")
+    if not result.complete and result.verified:
+        click.echo("  chain incomplete — an ancestor signature was not among those searched")
+    if result.error:
+        click.echo(f"  {result.error}")
 
     sys.exit(0 if result.verified else 1)

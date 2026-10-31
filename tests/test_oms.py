@@ -111,9 +111,19 @@ def test_export_refuses_an_ed25519_key(golden_model, tmp_path):
     assert "ECDSA" in str(excinfo.value)
 
 
-def test_export_writes_model_sig_by_default(golden_model, ec_keypair):
+def test_export_writes_the_bundle_inside_a_directory_by_default(
+    golden_model, ec_keypair
+):
+    """Inside the directory is where it travels with the repo and gets read."""
     oms.export_bundle(golden_model, key=ec_keypair["private"])
-    assert (golden_model.parent / oms.DEFAULT_BUNDLE_NAME).exists()
+    assert (golden_model / oms.DEFAULT_BUNDLE_NAME).exists()
+
+
+def test_export_writes_a_single_file_bundle_beside_it(tmp_path, ec_keypair):
+    model = tmp_path / "model.safetensors"
+    model.write_bytes(b"weights")
+    oms.export_bundle(model, key=ec_keypair["private"])
+    assert (tmp_path / oms.DEFAULT_BUNDLE_NAME).exists()
 
 
 def test_git_paths_are_excluded_like_model_signing(golden_model, ec_keypair):
@@ -263,3 +273,56 @@ def test_nested_gitignore_is_not_exempt(golden_model, ec_keypair, tmp_path):
     result = oms.verify_bundle(golden_model, bundle_path, pubkey=ec_keypair["public"])
     assert not result
     assert result.error == "unsigned files"
+
+
+def test_truncated_bundle_raises_oms_error(golden_model, ec_keypair, tmp_path):
+    bundle = tmp_path / "model.sig"
+    bundle.write_text('{"mediaType": "application/vnd.dev.sigstore')
+    with pytest.raises(oms.OMSError):
+        oms.verify_bundle(golden_model, bundle, pubkey=ec_keypair["public"])
+
+
+def test_bundle_missing_its_predicate_raises_oms_error(
+    golden_model, ec_keypair, tmp_path
+):
+    bundle_path = tmp_path / "model.sig"
+    bundle = oms.export_bundle(golden_model, key=ec_keypair["private"], out=bundle_path)
+    statement = json.loads(base64.b64decode(bundle["dsseEnvelope"]["payload"]))
+    del statement["predicate"]
+    bundle["dsseEnvelope"]["payload"] = base64.b64encode(
+        json.dumps(statement).encode()
+    ).decode()
+    bundle_path.write_text(json.dumps(bundle))
+    with pytest.raises(oms.OMSError):
+        oms.verify_bundle(golden_model, bundle_path, pubkey=ec_keypair["public"])
+
+
+def test_bundle_with_a_non_hex_digest_raises_oms_error(
+    golden_model, ec_keypair, tmp_path
+):
+    """A digest that is not hex must not reach bytes.fromhex as a ValueError."""
+    bundle_path = tmp_path / "model.sig"
+    bundle = oms.export_bundle(golden_model, key=ec_keypair["private"], out=bundle_path)
+    statement = json.loads(base64.b64decode(bundle["dsseEnvelope"]["payload"]))
+    statement["predicate"]["resources"][0]["digest"] = "not-a-hex-digest"
+    bundle["dsseEnvelope"]["payload"] = base64.b64encode(
+        json.dumps(statement).encode()
+    ).decode()
+    bundle_path.write_text(json.dumps(bundle))
+    with pytest.raises(oms.OMSError):
+        oms.verify_bundle(golden_model, bundle_path, pubkey=ec_keypair["public"])
+
+
+def test_bundle_with_many_subjects_raises_oms_error(
+    golden_model, ec_keypair, tmp_path
+):
+    bundle_path = tmp_path / "model.sig"
+    bundle = oms.export_bundle(golden_model, key=ec_keypair["private"], out=bundle_path)
+    statement = json.loads(base64.b64decode(bundle["dsseEnvelope"]["payload"]))
+    statement["subject"].append(dict(statement["subject"][0]))
+    bundle["dsseEnvelope"]["payload"] = base64.b64encode(
+        json.dumps(statement).encode()
+    ).decode()
+    bundle_path.write_text(json.dumps(bundle))
+    with pytest.raises(oms.OMSError):
+        oms.verify_bundle(golden_model, bundle_path, pubkey=ec_keypair["public"])

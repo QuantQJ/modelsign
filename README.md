@@ -31,7 +31,8 @@ One hook covers `transformers`, `sentence-transformers`, `diffusers` and vLLM, b
 
 - fetches `MODEL.sig` from the same repo as the weights rather than hoping it is already on disk;
 - refuses a download with **no** signature (`allow_unsigned=True` if you must);
-- requires a signature over the **whole snapshot** — a directory signature or an OMS bundle — because per-file signatures cannot say where in a repository a file belongs (`allow_per_file=True` opts into them, and then every file must carry one, so an unsigned `pytorch_model.bin` cannot ride along beside a signed `model.safetensors`);
+- requires a signature over the **whole snapshot** — a directory signature at `modelsign.sig` inside the repo (or `<dir>.sig` beside it), or an OMS bundle at `model.sig` — because per-file signatures cannot say where in a repository a file belongs (`allow_per_file=True` opts into them, and then every file must carry one, so an unsigned `pytorch_model.bin` cannot ride along beside a signed `model.safetensors`);
+- requires a key you already trust, not merely the one embedded in the signature (`allow_embedded=True` opts out);
 - rejects a modelsign 1.x signature of a single file, whose filename is not covered by the signature (`allow_unbound_names=True` opts out);
 - accepts an OMS bundle on equal footing when you pass `oms_pubkey=` (or `MODELSIGN_OMS_PUBKEY`).
 
@@ -57,11 +58,16 @@ modelsign inspect model.safetensors.sig
 
 Signing a directory produces one signature over a manifest of every file, so an added or swapped file breaks verification. That is the form to prefer for a multi-file model.
 
-In CI, demand a known signer — an embedded key proves the bytes are unchanged and nothing about who signed them:
+A signature is checked against a key you supply or one already in your keyring. The key embedded in the signature proves the bytes are unchanged and nothing about who signed them, so it is **not** accepted by default:
 
 ```bash
-modelsign verify ./model --require-trusted --pubkey vendor.pem
+modelsign verify ./model --pubkey vendor.pem       # identity + integrity
+modelsign verify ./model --allow-embedded-key      # integrity only, and says so
 ```
+
+A directory signature may be stored inside the directory it signs — the
+conventional name is `modelsign.sig`, which travels with a published repo. It
+is left out of its own manifest, the way OMS leaves out its bundle.
 
 ### Signature format
 
@@ -78,7 +84,9 @@ it. So prefer a directory signature for a multi-file model: the guard refuses
 a snapshot whose per-file signatures share a basename across directories,
 because those files would be interchangeable.
 
-`VerifyResult.name_bound` tells you which kind of signature you have.
+`VerifyResult.name_bound` says whether the model's own name is signed, and
+`paths_bound` whether its internal layout is — a single file has the first, a
+directory the second, and they are not the same property.
 Rejecting 1.x is the **default** in `verify_model`, in `modelsign verify` and
 in the guard; `require_name_binding=False` or `--allow-unbound-name` opts out,
 for old signatures you cannot re-sign.
@@ -97,6 +105,37 @@ result.identity      # the signed identity card
 ```
 
 `verify_model` returns a falsy `VerifyResult` for a failed check and raises `VerifyError` only when the check cannot be attempted. Nothing prints; nothing calls `sys.exit`.
+
+## Lineage
+
+A signed card can record `parent_signature`, the digest of the signature of
+the model this one came from. That turns a pile of signatures into a chain,
+and every link is checked rather than taken on trust:
+
+```bash
+modelsign sign sft.safetensors --name "Llama-3.1-8B-SFT" --parent base.safetensors.sig
+modelsign lineage dpo.safetensors --search ./registry --pubkey vendor.pem --require-complete
+```
+
+```
+LINEAGE VERIFIED dpo.safetensors  (3 link(s))
+  [ok ] Llama-3.1-8B-DPO
+        key ed25519:31d87c0f (bytes + signature)
+    [ok ] Llama-3.1-8B-SFT
+          key ed25519:31d87c0f (signature only)
+      [ok ] Llama-3.1-8B-Base
+            key ed25519:31d87c0f (signature only)
+```
+
+An ancestor's weights are usually long gone, and that is fine — a signature
+records the hash it was made over, so the signature verifies from the `.sig`
+alone. Be precise about what that proves: the ancestor's card and digest are
+authentic and unmodified, **not** that any file on this machine is that
+ancestor. The digest is taken over canonical JSON, so reformatting a `.sig`
+cannot break a chain pointing at it.
+
+Without `--require-complete`, a chain that runs out of findable ancestors is
+reported as verified but incomplete rather than failed.
 
 ## OpenSSF Model Signing interoperability
 

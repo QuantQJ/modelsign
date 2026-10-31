@@ -1,9 +1,12 @@
 """Directory manifest hashing for multi-file models."""
 
+from __future__ import annotations
+
 import hashlib
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Iterable
 
 from modelsign.formats.single import hash_file
 from modelsign.identity.canonical import canonical_json
@@ -17,11 +20,20 @@ def _workers(file_count: int) -> int:
     return max(1, min(file_count, (os.cpu_count() or 1)))
 
 
-def hash_directory(path: Path, max_workers: int | None = None) -> tuple[dict, str]:
+def hash_directory(
+    path: Path,
+    max_workers: int | None = None,
+    exclude: Iterable[str] = (),
+) -> tuple[dict, str]:
     """Hash all files in a directory, return (manifest_dict, manifest_hash).
 
     Files are sorted by UTF-8 byte order (NOT locale-aware) for
     deterministic results across Linux/macOS/Windows.
+
+    ``exclude`` holds relative POSIX paths to leave out — used for a signature
+    stored inside the directory it signs, which cannot be part of its own
+    manifest. Nothing is excluded by default, so a signature made before this
+    existed still verifies.
 
     Files are hashed concurrently — SHA-256 of one file is inherently
     sequential, but a sharded model is many files, and hashlib releases the
@@ -32,7 +44,11 @@ def hash_directory(path: Path, max_workers: int | None = None) -> tuple[dict, st
     if not path.exists():
         raise FileNotFoundError(f"Directory not found: {path}")
 
-    all_files = [f for f in path.rglob("*") if f.is_file()]
+    skip = set(exclude)
+    all_files = [
+        f for f in path.rglob("*")
+        if f.is_file() and f.relative_to(path).as_posix() not in skip
+    ]
     all_files.sort(key=lambda f: str(f.relative_to(path)).encode("utf-8"))
 
     workers = max_workers if max_workers is not None else _workers(len(all_files))

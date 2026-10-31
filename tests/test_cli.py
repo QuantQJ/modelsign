@@ -212,11 +212,20 @@ def test_verify_without_pubkey_warns_untrusted(tmp_path):
         "--key", str(key_dir / "private.pem"),
     ])
 
-    # Verify WITHOUT --pubkey — should still verify but warn about untrusted key
+    # Verify WITHOUT --pubkey — a key nobody vouched for is now refused.
     result = runner.invoke(main, ["verify", str(model_path)])
-    assert result.exit_code == 0
-    assert "VERIFIED" in result.output
-    assert "UNVERIFIED" in result.output or "WARNING" in result.output or "not independently trusted" in result.output
+    assert result.exit_code == 1
+    assert "untrusted key" in result.output
+
+    # Integrity without identity is available, and says so.
+    allowed = runner.invoke(main, ["verify", str(model_path), "--allow-embedded-key"])
+    assert allowed.exit_code == 0
+    assert "VERIFIED" in allowed.output
+    assert (
+        "UNVERIFIED" in allowed.output
+        or "WARNING" in allowed.output
+        or "not independently trusted" in allowed.output
+    )
 
 
 def test_verify_tampered_file_shows_hash_mismatch(tmp_path):

@@ -35,7 +35,7 @@ from modelsign.formats.directory import hash_directory
 from modelsign.formats.single import hash_file
 from modelsign.identity.canonical import canonical_json
 from modelsign.identity.card import ModelCard, validate_card
-from modelsign.sig import SigFile, read_sig, write_sig
+from modelsign.sig import SigFile, read_sig, sig_digest, write_sig
 
 DEFAULT_KEY_DIR = Path.home() / ".modelsign"
 
@@ -54,6 +54,10 @@ class VerifyError(Exception):
     """A verification could not be attempted (missing or unreadable input)."""
 
 
+class _CallerKeyError(Exception):
+    """A key the caller supplied could not be loaded — their problem, not the sig's."""
+
+
 @dataclass
 class VerifyResult:
     """Outcome of one verification. Falsy when the model did not verify."""
@@ -69,7 +73,18 @@ class VerifyResult:
     signed_at: Optional[str] = None
     identity: dict = field(default_factory=dict)
     name_bound: bool = False
-    """Whether the model's name is covered by the signature (v2 and later)."""
+    """Whether the model's own name is covered by the signature.
+
+    True for a single file signed with format 2.0 or later. False for a
+    directory, whose own name is deliberately not signed — see ``paths_bound``.
+    """
+
+    paths_bound: bool = False
+    """Whether the layout inside the model is covered by the signature.
+
+    True for a directory signature, whose manifest hash covers every relative
+    path, so a file cannot be added, removed or moved within it.
+    """
 
     @property
     def trusted(self) -> bool:
@@ -88,10 +103,22 @@ def _major(version: str) -> int:
         return 0
 
 
-def _hash_model(model_path: Path) -> tuple[Optional[dict], str]:
-    if model_path.is_dir():
-        return hash_directory(model_path)
-    return None, hash_file(model_path)
+def _hash_model(
+    model_path: Path, sig_file: Optional[Path] = None
+) -> tuple[Optional[dict], str]:
+    """Hash a model, leaving out a signature stored inside it."""
+    if not model_path.is_dir():
+        return None, hash_file(model_path)
+
+    exclude = []
+    if sig_file is not None:
+        try:
+            exclude.append(
+                Path(sig_file).resolve().relative_to(model_path.resolve()).as_posix()
+            )
+        except ValueError:
+            pass  # the signature sits outside the directory; nothing to skip
+    return hash_directory(model_path, exclude=exclude)
 
 
 def _message_for(
@@ -116,7 +143,7 @@ def _message_for(
 
 def default_sig_path(model_path: Path | str) -> Path:
     """Where a model's signature lives by convention: MODEL.sig beside it."""
-    return Path(str(model_path) + ".sig")
+    return Path(str(Path(model_path).expanduser()) + ".sig")
 
 
 def sign_model(
@@ -126,24 +153,33 @@ def sign_model(
     name: str | None = None,
     key: Ed25519PrivateKey | Path | str | None = None,
     sig_path: Path | str | None = None,
+    parent: Path | str | SigFile | None = None,
     write: bool = True,
 ) -> SigFile:
     """Sign a model file or directory and return the signature.
 
     Provide either ``card`` (full identity) or ``name``. ``key`` may be a
     loaded private key or a path to a PEM; it defaults to the keygen location.
+
+    ``parent`` is the signature of the model this one was derived from; its
+    digest is recorded in the card as ``parent_signature``, which
+    :mod:`modelsign.lineage` walks. An explicit ``parent_signature`` already
+    in the card wins.
     """
-    model_path = Path(model_path)
+    model_path = Path(model_path).expanduser()
     if not model_path.exists():
         raise VerifyError(f"model not found: {model_path}")
 
     if isinstance(key, Ed25519PrivateKey):
         private_key = key
     else:
-        priv_path = Path(key) if key is not None else DEFAULT_KEY_DIR / "private.pem"
+        priv_path = Path(key).expanduser() if key is not None else DEFAULT_KEY_DIR / "private.pem"
         if not priv_path.exists():
             raise VerifyError(f"no key found at {priv_path}. Run 'modelsign keygen' first.")
-        private_key = load_private_key(priv_path)
+        try:
+            private_key = load_private_key(priv_path)
+        except Exception as e:
+            raise VerifyError(f"could not load the signing key {priv_path}: {e}") from e
 
     if card is None:
         if name is None:
@@ -151,12 +187,18 @@ def sign_model(
         card = ModelCard(name=name)
     elif isinstance(card, dict):
         card = ModelCard.from_dict(card)
+
+    if parent is not None and not card.parent_signature:
+        card.parent_signature = sig_digest(parent)
+
     validate_card(card)
 
     identity_dict = card.to_dict()
     identity_bytes = canonical_json(identity_dict)
 
-    manifest, model_hash = _hash_model(model_path)
+    bundle_sig_path = Path(sig_path) if sig_path else default_sig_path(model_path)
+
+    manifest, model_hash = _hash_model(model_path, bundle_sig_path)
     message = _message_for(
         model_path, model_hash, identity_bytes, name=model_path.name
     )
@@ -176,7 +218,7 @@ def sign_model(
     )
 
     if write:
-        write_sig(sig, Path(sig_path) if sig_path else default_sig_path(model_path))
+        write_sig(sig, bundle_sig_path)
     return sig
 
 
@@ -187,9 +229,13 @@ def _resolve_public_key(
 ) -> tuple[Ed25519PublicKey, str, Optional[str]]:
     """Return (key, trust level, keyring alias) for verifying this signature."""
     if pubkey is not None:
-        return load_public_key(Path(pubkey)), TRUST_PUBKEY, None
+        try:
+            loaded = load_public_key(Path(pubkey).expanduser())
+        except Exception as e:
+            raise _CallerKeyError(f"could not load public key {pubkey}: {e}") from e
+        return loaded, TRUST_PUBKEY, None
 
-    kr_dir = Path(keyring_dir) if keyring_dir else DEFAULT_KEY_DIR / "keyring"
+    kr_dir = Path(keyring_dir).expanduser() if keyring_dir else DEFAULT_KEY_DIR / "keyring"
     for entry in keyring_list(kr_dir):
         if entry["fingerprint"] == sig.key_fingerprint:
             return load_public_key(Path(entry["path"])), TRUST_KEYRING, entry["alias"]
@@ -204,7 +250,7 @@ def verify_model(
     sig_path: Path | str | None = None,
     pubkey: Path | str | None = None,
     keyring_dir: Path | str | None = None,
-    require_trusted: bool = False,
+    require_trusted: bool = True,
     require_name_binding: bool = True,
 ) -> VerifyResult:
     """Verify a model against its signature.
@@ -213,43 +259,61 @@ def verify_model(
     exception. :class:`VerifyError` is raised only when the check cannot be
     attempted at all (model or signature missing or unreadable).
 
-    With ``require_trusted``, a signature that can only be checked against its
-    own embedded key is reported as unverified — use it wherever the identity
-    of the signer matters, not just the integrity of the bytes.
+    ``require_trusted`` is on by default: a signature that can only be checked
+    against its own embedded key is reported as unverified, because anyone can
+    generate a key. Pass False when you want integrity alone and have some
+    other reason to trust the source.
 
     ``require_name_binding`` is on by default: a modelsign 1.x signature of a
     single file is rejected, because that format leaves the filename out of
     the signed message. Pass False only for old signatures you cannot
     re-sign.
     """
-    model_path = Path(model_path)
-    sig_file = Path(sig_path) if sig_path else default_sig_path(model_path)
+    model_path = Path(model_path).expanduser()
+    sig_file = Path(sig_path).expanduser() if sig_path else default_sig_path(model_path)
 
     if not model_path.exists():
         raise VerifyError(f"model not found: {model_path}")
     if not sig_file.exists():
         raise VerifyError(f"sig file not found: {sig_file}")
 
+    # The .sig is attacker-supplied input, so every way it can be malformed —
+    # an unsupported version, a missing field, a key that is not a key — is a
+    # failed verification rather than an exception the caller must anticipate.
     try:
         sig = read_sig(sig_file, validate_fingerprint=True)
-    except ValueError as e:
+    except Exception as e:
         return VerifyResult(
             verified=False,
             model=str(model_path),
-            error="corrupted sig",
-            detail=str(e),
+            error="malformed sig",
+            detail=f"{type(e).__name__}: {e}",
         )
 
-    key, trust, alias = _resolve_public_key(sig, pubkey, keyring_dir)
+    try:
+        key, trust, alias = _resolve_public_key(sig, pubkey, keyring_dir)
+    except _CallerKeyError as e:
+        raise VerifyError(str(e)) from e
+    except Exception as e:
+        return VerifyResult(
+            verified=False,
+            model=str(model_path),
+            error="malformed sig",
+            detail=f"unusable public key — {type(e).__name__}: {e}",
+        )
     fingerprint = compute_fingerprint(key)
 
     # v2 puts the model's name inside the signed message. v1 did not, so a v1
     # .sig's `file` field is unauthenticated — comparing it is worth doing to
     # catch an accidental rename, but it stops nobody who can edit the file.
-    # For a directory, every relative path is inside the signed manifest hash.
-    # For a single file, only v2 puts the name in the signed message.
-    name_bound = model_path.is_dir() or _major(sig.modelsign_version) >= 2
-    if require_name_binding and not name_bound:
+    # A directory's manifest hash covers every relative path inside it; a
+    # single file's name is covered only by format 2.0 and later. Either
+    # satisfies a caller asking that the signature bind the model's identity,
+    # but they are not the same property, so they are reported separately.
+    is_dir = model_path.is_dir()
+    paths_bound = is_dir
+    name_bound = (not is_dir) and _major(sig.modelsign_version) >= 2
+    if require_name_binding and not (name_bound or paths_bound):
         return VerifyResult(
             verified=False,
             model=str(model_path),
@@ -265,7 +329,10 @@ def verify_model(
             identity=sig.identity,
         )
 
-    _, model_hash = _hash_model(model_path)
+    try:
+        _, model_hash = _hash_model(model_path, sig_file)
+    except OSError as e:
+        raise VerifyError(f"could not read {model_path}: {e}") from e
 
     # Integrity before authenticity: a modified file is reported as such even
     # when the signature over the original bytes is itself intact.
@@ -283,6 +350,7 @@ def verify_model(
             signed_at=sig.signed_at,
             identity=sig.identity,
             name_bound=name_bound,
+            paths_bound=paths_bound,
         )
 
     identity_bytes = canonical_json(sig.identity)
@@ -323,10 +391,11 @@ def verify_model(
             signed_at=sig.signed_at,
             identity=sig.identity,
             name_bound=name_bound,
+            paths_bound=paths_bound,
         )
 
     # A v1 signature cannot bind the name, so report a rename as best we can.
-    if not name_bound and not model_path.is_dir() and sig.file != model_path.name:
+    if not name_bound and not is_dir and sig.file != model_path.name:
         return VerifyResult(
             verified=False,
             model=str(model_path),
@@ -342,6 +411,7 @@ def verify_model(
             signed_at=sig.signed_at,
             identity=sig.identity,
             name_bound=False,
+            paths_bound=paths_bound,
         )
 
     if require_trusted and trust not in _TRUSTED:
@@ -359,6 +429,7 @@ def verify_model(
             signed_at=sig.signed_at,
             identity=sig.identity,
             name_bound=name_bound,
+            paths_bound=paths_bound,
         )
 
     return VerifyResult(
@@ -371,4 +442,5 @@ def verify_model(
         signed_at=sig.signed_at,
         identity=sig.identity,
         name_bound=name_bound,
+        paths_bound=paths_bound,
     )

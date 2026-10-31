@@ -21,6 +21,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,6 +45,8 @@ DEFAULT_IGNORE_PATHS = (".git", ".github", ".gitattributes", ".gitignore")
 
 #: Conventional bundle filename used by the model-signing CLI.
 DEFAULT_BUNDLE_NAME = "model.sig"
+
+_HEX64 = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 class OMSError(Exception):
@@ -115,7 +118,9 @@ def generate_ec_keypair(key_dir: Path | str) -> tuple[Path, Path]:
 
 
 def load_ec_private_key(path: Path | str) -> ec.EllipticCurvePrivateKey:
-    key = serialization.load_pem_private_key(Path(path).read_bytes(), password=None)
+    key = serialization.load_pem_private_key(
+        Path(path).expanduser().read_bytes(), password=None
+    )
     if not isinstance(key, ec.EllipticCurvePrivateKey):
         raise OMSError(
             f"OMS signing needs an ECDSA private key, got {type(key).__name__}. "
@@ -126,7 +131,7 @@ def load_ec_private_key(path: Path | str) -> ec.EllipticCurvePrivateKey:
 
 
 def load_ec_public_key(path: Path | str) -> ec.EllipticCurvePublicKey:
-    key = serialization.load_pem_public_key(Path(path).read_bytes())
+    key = serialization.load_pem_public_key(Path(path).expanduser().read_bytes())
     if not isinstance(key, ec.EllipticCurvePublicKey):
         raise OMSError(
             f"OMS verification needs an ECDSA public key, got {type(key).__name__}."
@@ -245,7 +250,14 @@ def export_bundle(
 
     # A bundle stored inside the model directory cannot be part of its own
     # manifest, so it joins the ignore list — which is what model-signing does.
-    bundle_path = Path(out) if out else model_path.parent / DEFAULT_BUNDLE_NAME
+    # A directory's bundle defaults inside it, so it travels with the repo and
+    # sits where a verifier looks; a single file's sits beside it.
+    if out is not None:
+        bundle_path = Path(out).expanduser()
+    elif model_path.is_dir():
+        bundle_path = model_path / DEFAULT_BUNDLE_NAME
+    else:
+        bundle_path = model_path.parent / DEFAULT_BUNDLE_NAME
     ignore_paths = list(ignore_paths)
     if model_path.is_dir():
         try:
@@ -293,6 +305,8 @@ def export_bundle(
 
 
 def _statement_from(bundle: dict) -> tuple[dict, bytes]:
+    if not isinstance(bundle, dict):
+        raise OMSError(f"bundle is not a JSON object but {type(bundle).__name__}")
     if bundle.get("mediaType") != BUNDLE_MEDIA_TYPE:
         raise OMSError(
             f"unexpected bundle media type {bundle.get('mediaType')!r}, "
@@ -310,6 +324,32 @@ def _statement_from(bundle: dict) -> tuple[dict, bytes]:
         raise OMSError(f"unexpected statement type {statement.get('_type')!r}")
     if statement.get("predicateType") != PREDICATE_TYPE:
         raise OMSError(f"unexpected predicate type {statement.get('predicateType')!r}")
+
+    # Shape, not just types: every field read below has to be there, or a
+    # truncated bundle surfaces as a KeyError the caller never anticipated.
+    predicate = statement.get("predicate")
+    if not isinstance(predicate, dict):
+        raise OMSError("bundle has no predicate object")
+    resources = predicate.get("resources")
+    if not isinstance(resources, list):
+        raise OMSError("bundle predicate has no resources list")
+    for entry in resources:
+        if not isinstance(entry, dict) or "name" not in entry or "digest" not in entry:
+            raise OMSError(f"bundle lists a malformed resource: {entry!r}")
+        digest = entry["digest"]
+        if not isinstance(digest, str) or not _HEX64.match(digest):
+            raise OMSError(
+                f"resource {entry.get('name')!r} has a digest that is not "
+                f"64 hex characters: {digest!r}"
+            )
+    subjects = statement.get("subject")
+    if not isinstance(subjects, list) or len(subjects) != 1:
+        raise OMSError("bundle must carry exactly one subject")
+    subject_digest = (subjects[0] or {}).get("digest", {})
+    if not isinstance(subject_digest, dict) or not _HEX64.match(
+        str(subject_digest.get("sha256", ""))
+    ):
+        raise OMSError("bundle subject has no sha256 digest")
     return statement, payload
 
 
@@ -327,15 +367,18 @@ def verify_bundle(
     :class:`~modelsign.api.VerifyResult`; a malformed bundle raises
     :class:`OMSError`.
     """
-    model_path = Path(model_path)
-    bundle_path = Path(bundle_path)
+    model_path = Path(model_path).expanduser()
+    bundle_path = Path(bundle_path).expanduser()
     if not model_path.exists():
         raise VerifyError(f"model not found: {model_path}")
     if not bundle_path.exists():
         raise VerifyError(f"bundle not found: {bundle_path}")
 
     public_key = pubkey if isinstance(pubkey, ec.EllipticCurvePublicKey) else load_ec_public_key(pubkey)
-    bundle = json.loads(bundle_path.read_text())
+    try:
+        bundle = json.loads(bundle_path.read_text())
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+        raise OMSError(f"could not read the bundle at {bundle_path}: {e}") from e
     statement, payload = _statement_from(bundle)
 
     hint = ((bundle.get("verificationMaterial") or {}).get("publicKey") or {}).get("hint")
@@ -349,9 +392,12 @@ def verify_bundle(
         )
 
     signatures = (bundle.get("dsseEnvelope") or {}).get("signatures") or []
-    if not signatures:
+    if not signatures or not isinstance(signatures[0], dict) or "sig" not in signatures[0]:
         raise OMSError("bundle carries no signature")
-    raw_sig = base64.b64decode(signatures[0]["sig"])
+    try:
+        raw_sig = base64.b64decode(signatures[0]["sig"], validate=True)
+    except Exception as e:
+        raise OMSError(f"bundle signature is not valid base64: {e}") from e
 
     for encode in (pae, pae_compat):
         try:
