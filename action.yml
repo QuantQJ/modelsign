@@ -67,7 +67,9 @@ runs:
             args+=(--bundle "$BUNDLE")
           fi
         else
-          args=(verify "$MODEL" --pubkey "$PUBKEY")
+          # --require-trusted is the CLI default, and passed anyway so this
+          # action's guarantee does not depend on a default it cannot control.
+          args=(verify "$MODEL" --pubkey "$PUBKEY" --require-trusted)
         fi
 
         echo "::group::modelsign ${args[*]}"

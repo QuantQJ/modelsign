@@ -353,3 +353,64 @@ def test_oms_export_rejects_ed25519_key(tmp_path, tmp_keypair):
     )
     assert result.exit_code == 1
     assert "ECDSA" in result.output
+
+
+def test_keygen_does_not_clobber_another_keypairs_public_key(tmp_path):
+    """Two keypairs in one directory used to silently share public.pem."""
+    from click.testing import CliRunner
+
+    from modelsign.cli import main
+    from modelsign.crypto.keys import (
+        compute_fingerprint,
+        load_private_key,
+        load_public_key,
+    )
+
+    runner = CliRunner()
+    first = runner.invoke(main, ["keygen", "--out", str(tmp_path / "a.pem")])
+    second = runner.invoke(main, ["keygen", "--out", str(tmp_path / "b.pem")])
+    assert first.exit_code == 0 and second.exit_code == 0
+
+    for name in ("a", "b"):
+        priv = tmp_path / f"{name}.pem"
+        pub = tmp_path / f"{name}_public.pem"
+        assert pub.exists(), f"{name} has no public key of its own"
+        assert compute_fingerprint(load_public_key(pub)) == compute_fingerprint(
+            load_private_key(priv).public_key()
+        )
+
+
+def test_keygen_keeps_the_private_pem_convention(tmp_path):
+    from click.testing import CliRunner
+
+    from modelsign.cli import main
+
+    result = CliRunner().invoke(
+        main, ["keygen", "--out", str(tmp_path / "keys" / "private.pem")]
+    )
+    assert result.exit_code == 0
+    assert (tmp_path / "keys" / "public.pem").exists()
+
+
+def test_keygen_refuses_to_overwrite_a_foreign_public_key(tmp_path):
+    from click.testing import CliRunner
+
+    from modelsign.cli import main
+
+    (tmp_path / "c_public.pem").write_bytes(b"someone else's key")
+    result = CliRunner().invoke(main, ["keygen", "--out", str(tmp_path / "c.pem")])
+    assert result.exit_code == 1
+    assert "belongs to another key" in result.output
+
+
+def test_the_reported_public_key_belongs_to_the_private_key(tmp_path):
+    """A stray public.pem must not be reported as this key's."""
+    from click.testing import CliRunner
+
+    from modelsign.cli import main
+
+    (tmp_path / "public.pem").write_bytes(b"stray, unrelated")
+    result = CliRunner().invoke(main, ["keygen", "--out", str(tmp_path / "mine.pem")])
+    assert result.exit_code == 0
+    assert "mine_public.pem" in result.output
+    assert "Public key:  " + str(tmp_path / "public.pem") not in result.output

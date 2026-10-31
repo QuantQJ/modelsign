@@ -1,15 +1,19 @@
 """Click-based CLI for modelsign — sign, verify, inspect AI models."""
 
 import json
+import os
 import sys
 from pathlib import Path
 
 import click
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 import modelsign
 from modelsign.crypto.keys import (
     compute_fingerprint,
     generate_keypair,
+    load_public_key,
     keyring_add,
     keyring_list,
     keyring_remove,
@@ -43,33 +47,29 @@ def version():
 @click.option("--out", "out_path", default=None, help="Path for private key PEM file.")
 def keygen(out_path):
     """Generate an Ed25519 keypair."""
-    if out_path is not None:
-        priv_path = Path(out_path)
-        key_dir = priv_path.parent
-        # generate_keypair always creates private.pem + public.pem in the dir.
-        # We need to handle a custom private key name — generate into a temp subdir
-        # then move, OR: call generate_keypair on the parent dir and rename if needed.
-        # Simplest: generate into parent dir under standard names, then rename to desired.
-        tmp_priv = key_dir / "private.pem"
-        tmp_pub = key_dir / "public.pem"
-
-        # If already exists at out_path, just report fingerprint.
+    if out_path is None:
+        priv_path, _ = generate_keypair(DEFAULT_KEY_DIR)
+    else:
+        priv_path = Path(out_path).expanduser()
         if priv_path.exists():
-            pub_path = _find_pubkey_for_private(priv_path)
-            priv_key = load_private_key(priv_path)
-            fp = compute_fingerprint(priv_key.public_key())
+            existing = compute_fingerprint(load_private_key(priv_path).public_key())
             click.echo(f"Key already exists: {priv_path}")
-            click.echo(f"Fingerprint: {fp}")
+            click.echo(f"Fingerprint: {existing}")
             return
 
-        key_dir.mkdir(parents=True, exist_ok=True)
+        pub_path = _expected_pubkey_path(priv_path)
+        if pub_path.exists():
+            click.echo(
+                f"Error: {pub_path} already exists and belongs to another key. "
+                "Choose a different name, or remove it first.",
+                err=True,
+            )
+            sys.exit(1)
 
-        if priv_path.name != "private.pem":
-            # Generate with standard names then rename
-            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-            from cryptography.hazmat.primitives import serialization
-            import os
-
+        priv_path.parent.mkdir(parents=True, exist_ok=True)
+        if priv_path.name == "private.pem":
+            generate_keypair(priv_path.parent)
+        else:
             private_key = Ed25519PrivateKey.generate()
             priv_path.write_bytes(private_key.private_bytes(
                 encoding=serialization.Encoding.PEM,
@@ -77,41 +77,60 @@ def keygen(out_path):
                 encryption_algorithm=serialization.NoEncryption(),
             ))
             os.chmod(priv_path, 0o600)
-
-            pub_path = priv_path.parent / (priv_path.stem + "_public.pem")
-            # Use sibling public.pem convention
-            pub_path = priv_path.with_name("public.pem")
             pub_path.write_bytes(private_key.public_key().public_bytes(
                 encoding=serialization.Encoding.PEM,
                 format=serialization.PublicFormat.SubjectPublicKeyInfo,
             ))
-            fp = compute_fingerprint(private_key.public_key())
-        else:
-            actual_priv, actual_pub = generate_keypair(key_dir)
-            priv_key = load_private_key(actual_priv)
-            fp = compute_fingerprint(priv_key.public_key())
-    else:
-        priv_path, pub_path = generate_keypair(DEFAULT_KEY_DIR)
-        priv_key = load_private_key(priv_path)
-        fp = compute_fingerprint(priv_key.public_key())
 
+    fingerprint = compute_fingerprint(load_private_key(priv_path).public_key())
     click.echo(f"Private key: {priv_path}")
-    pub_path = _find_pubkey_for_private(priv_path)
-    click.echo(f"Public key:  {pub_path}")
-    click.echo(f"Fingerprint: {fp}")
+    click.echo(f"Public key:  {_find_pubkey_for_private(priv_path)}")
+    click.echo(f"Fingerprint: {fingerprint}")
+
+
+def _expected_pubkey_path(priv_path: Path) -> Path:
+    """Where this private key's public half belongs.
+
+    ``private.pem`` keeps the historical ``public.pem`` sibling. Any other
+    name gets ``<stem>_public.pem``, so two keypairs in one directory cannot
+    silently overwrite each other's public key — which is what happened
+    before: the correct name was computed and then replaced by public.pem.
+    """
+    if priv_path.name == "private.pem":
+        return priv_path.with_name("public.pem")
+    return priv_path.with_name(priv_path.stem + "_public.pem")
 
 
 def _find_pubkey_for_private(priv_path: Path) -> Path:
-    """Locate the public key alongside a private key."""
-    # Standard convention: public.pem lives next to private.pem
-    pub = priv_path.parent / "public.pem"
-    if pub.exists():
-        return pub
-    # Fallback: same stem with _public suffix
-    pub2 = priv_path.with_name(priv_path.stem + "_public.pem")
-    if pub2.exists():
-        return pub2
-    return pub  # Return expected path even if missing (for display)
+    """Locate the public key that actually belongs to this private key.
+
+    Candidates are checked against the private key rather than taken on their
+    filename, so a public.pem left by a different keypair is not reported as
+    this one's.
+    """
+    expected = _expected_pubkey_path(priv_path)
+    candidates = [
+        expected,
+        priv_path.with_name("public.pem"),
+        priv_path.with_name(priv_path.stem + "_public.pem"),
+    ]
+
+    try:
+        wanted = compute_fingerprint(load_private_key(priv_path).public_key())
+    except Exception:
+        wanted = None
+
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        if wanted is None:
+            return candidate
+        try:
+            if compute_fingerprint(load_public_key(candidate)) == wanted:
+                return candidate
+        except Exception:
+            continue
+    return expected
 
 
 @main.command()
