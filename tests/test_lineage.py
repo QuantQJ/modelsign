@@ -174,3 +174,140 @@ def test_directory_models_can_be_ancestors(tmp_path, tmp_keypair, tmp_model_dir)
     )
     assert result
     assert [link.name for link in result.chain] == ["Child", "Dir-Base"]
+
+
+# -- an ancestor must be signed by a key the verifier already trusts
+
+
+def test_a_forged_ancestor_chain_is_refused(tmp_path, tmp_keypair):
+    """Anyone can generate a key and mint a plausible ancestor."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    attacker = Ed25519PrivateKey.generate()
+    attacker_pem = tmp_path / "attacker.pem"
+    attacker_pem.write_bytes(attacker.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ))
+
+    registry = tmp_path / "registry"
+    registry.mkdir()
+
+    # An "ancestor" invented wholesale by the attacker.
+    fake_base = tmp_path / "fake-base.safetensors"
+    fake_base.write_bytes(b"fabricated-base")
+    sign_model(fake_base, name="Totally-Legit-Base", key=attacker_pem)
+    (registry / "fake-base.safetensors.sig").write_bytes(
+        default_sig_path(fake_base).read_bytes()
+    )
+
+    # The model in hand is properly signed and points at the fake ancestor.
+    child = tmp_path / "child.safetensors"
+    child.write_bytes(b"child-weights")
+    sign_model(
+        child,
+        name="Child",
+        key=tmp_keypair["private"],
+        parent=default_sig_path(fake_base),
+    )
+
+    # With an explicit key, the attacker's ancestor fails as a bad signature:
+    # the vendor key is the only one tried.
+    result = verify_lineage(child, search=[registry], pubkey=tmp_keypair["public"])
+    assert not result
+    assert result.chain[-1].error == "invalid signature"
+
+    # With a keyring holding the vendor key, the model in hand is trusted and
+    # the forged ancestor is refused specifically for its key.
+    keyring = tmp_path / "keyring"
+    keyring.mkdir()
+    (keyring / "vendor.pem").write_bytes(tmp_keypair["public"].read_bytes())
+
+    strict = verify_lineage(child, search=[registry], keyring_dir=keyring)
+    assert not strict
+    assert strict.chain[0].ok is True
+    assert strict.chain[-1].error == "untrusted key"
+
+    # The forgery is internally consistent — which is exactly why consistency
+    # alone is not enough.
+    lenient = verify_lineage(
+        child, search=[registry], keyring_dir=keyring, require_trusted=False
+    )
+    assert lenient
+    assert lenient.chain[-1].signature_valid is True
+
+
+def test_an_ancestor_signed_by_a_keyring_key_is_trusted(chain, tmp_keypair, tmp_path):
+    keyring = tmp_path / "keyring"
+    keyring.mkdir()
+    (keyring / "vendor.pem").write_bytes(tmp_keypair["public"].read_bytes())
+
+    result = verify_lineage(
+        chain["dpo"],
+        search=[chain["registry"]],
+        keyring_dir=keyring,
+        require_complete=True,
+    )
+    assert result
+    assert all(link.trusted_alias == "vendor" for link in result.chain[1:])
+
+
+def test_require_trusted_can_be_turned_off_for_an_embedded_key_chain(
+    tmp_path, tmp_keypair
+):
+    """Internal consistency only, and the result says that is all it is."""
+    registry = tmp_path / "registry"
+    registry.mkdir()
+    base = tmp_path / "base.safetensors"
+    base.write_bytes(b"base")
+    sign_model(base, name="Base", key=tmp_keypair["private"])
+    (registry / "base.sig").write_bytes(default_sig_path(base).read_bytes())
+
+    child = tmp_path / "child.safetensors"
+    child.write_bytes(b"child")
+    sign_model(
+        child, name="Child", key=tmp_keypair["private"], parent=default_sig_path(base)
+    )
+
+    result = verify_lineage(
+        child,
+        search=[registry],
+        pubkey=tmp_keypair["public"],
+        require_trusted=False,
+        require_complete=True,
+    )
+    assert result
+
+
+def test_sig_digest_covers_the_signing_key(tmp_path, tmp_keypair):
+    """Re-signing the same bytes with another key must change the digest."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    other = tmp_path / "other.pem"
+    other.write_bytes(Ed25519PrivateKey.generate().private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ))
+
+    model = tmp_path / "model.safetensors"
+    model.write_bytes(b"identical-weights")
+    first = sign_model(model, name="Same", key=tmp_keypair["private"], write=False)
+    second = sign_model(model, name="Same", key=other, write=False)
+    assert sig_digest(first) != sig_digest(second)
+
+
+def test_approvals_do_not_change_the_digest(tmp_path, tmp_keypair):
+    """Appending an approval must not break a chain that points at this sig."""
+    from modelsign.approvals import approve
+
+    model = tmp_path / "model.safetensors"
+    model.write_bytes(b"weights")
+    sign_model(model, name="Approved", key=tmp_keypair["private"])
+    before = sig_digest(default_sig_path(model))
+
+    approve(model, key=tmp_keypair["private"], role="release-manager")
+    assert sig_digest(default_sig_path(model)) == before

@@ -23,9 +23,11 @@ from typing import Iterable, Optional
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from modelsign.api import (
+    TRUST_EMBEDDED,
     VerifyError,
     VerifyResult,
     _major,
+    _resolve_public_key,
     default_sig_path,
     verify_model,
 )
@@ -60,10 +62,18 @@ def _signed_message(sig: SigFile) -> bytes:
     return build_file_message(digest, identity_bytes)
 
 
-def verify_signature_only(sig: SigFile) -> bool:
-    """Check a signature's own authenticity without needing the model file."""
+def verify_signature_only(
+    sig: SigFile, key: Ed25519PublicKey | None = None
+) -> bool:
+    """Check a signature's own authenticity without needing the model file.
+
+    ``key`` is the key to check against. Without one the signature's own
+    embedded key is used, which proves internal consistency and nothing about
+    who produced it — callers that care pass a trusted key.
+    """
     try:
-        key = Ed25519PublicKey.from_public_bytes(base64.b64decode(sig.public_key))
+        if key is None:
+            key = Ed25519PublicKey.from_public_bytes(base64.b64decode(sig.public_key))
         return verify_bytes(_signed_message(sig), base64.b64decode(sig.signature), key)
     except Exception:
         return False
@@ -78,14 +88,16 @@ class Link:
     digest: Optional[str] = None
     name: str = ""
     parent_digest: Optional[str] = None
+    trusted_alias: Optional[str] = None
     signature_valid: bool = False
+    key_trusted: bool = False
     key_fingerprint: Optional[str] = None
     bytes_verified: bool = False
     error: Optional[str] = None
 
     @property
     def ok(self) -> bool:
-        return self.signature_valid and self.error is None
+        return self.signature_valid and self.key_trusted and self.error is None
 
 
 @dataclass
@@ -133,12 +145,19 @@ def verify_lineage(
     keyring_dir: Path | str | None = None,
     require_complete: bool = False,
     require_name_binding: bool = True,
+    require_trusted: bool = True,
     max_depth: int = 64,
 ) -> LineageResult:
     """Verify a model and then every ancestor its card points back to.
 
     The model itself is verified against its bytes. Each ancestor is located
-    by its signature digest among ``search`` and verified from its signature.
+    by its signature digest among ``search`` and verified from its signature,
+    against a key resolved the same way the model's own key is — a supplied
+    public key or the local keyring. ``require_trusted`` is on by default: an
+    ancestor checkable only against the key bundled in its own ``.sig`` proves
+    internal consistency and nothing about who made it, so a chain of forged
+    ancestors cannot pass by default.
+
     A chain ends when a card records no parent; with ``require_complete`` a
     chain whose next link cannot be found is a failure rather than a stop.
     """
@@ -152,6 +171,7 @@ def verify_lineage(
             pubkey=pubkey,
             keyring_dir=keyring_dir,
             require_name_binding=require_name_binding,
+            require_trusted=require_trusted,
         )
     except VerifyError as e:
         return LineageResult(verified=False, error=str(e))
@@ -165,6 +185,7 @@ def verify_lineage(
             name=sig.identity.get("name", ""),
             parent_digest=sig.identity.get("parent_signature"),
             signature_valid=head.verified,
+            key_trusted=head.trusted or not require_trusted,
             key_fingerprint=head.fingerprint,
             bytes_verified=head.verified,
             error=head.error,
@@ -199,9 +220,36 @@ def verify_lineage(
                 )
             return LineageResult(verified=True, chain=chain, complete=False)
 
-        parent_sig = read_sig(found)
-        valid = verify_signature_only(parent_sig)
-        key = Ed25519PublicKey.from_public_bytes(base64.b64decode(parent_sig.public_key))
+        try:
+            parent_sig = read_sig(found, validate_fingerprint=True)
+        except Exception as e:
+            chain.append(Link(depth=len(chain), sig_path=found, digest=parent,
+                              error=f"malformed sig: {type(e).__name__}"))
+            return LineageResult(
+                verified=False, chain=chain,
+                error=f"ancestor at depth {len(chain) - 1} could not be read",
+            )
+
+        # Same trust path as the model in hand: a supplied key or the keyring,
+        # falling back to the sig's own key only to report that it did.
+        try:
+            key, trust, alias = _resolve_public_key(parent_sig, pubkey, keyring_dir)
+        except Exception as e:
+            chain.append(Link(depth=len(chain), sig_path=found, digest=parent,
+                              error=f"unusable key: {type(e).__name__}"))
+            return LineageResult(
+                verified=False, chain=chain,
+                error=f"ancestor at depth {len(chain) - 1} has no usable key",
+            )
+
+        valid = verify_signature_only(parent_sig, key)
+        trusted = trust != TRUST_EMBEDDED
+        error = None
+        if not valid:
+            error = "invalid signature"
+        elif require_trusted and not trusted:
+            error = "untrusted key"
+
         link = Link(
             depth=len(chain),
             sig_path=found,
@@ -209,14 +257,16 @@ def verify_lineage(
             name=parent_sig.identity.get("name", ""),
             parent_digest=parent_sig.identity.get("parent_signature"),
             signature_valid=valid,
+            key_trusted=trusted or not require_trusted,
             key_fingerprint=compute_fingerprint(key),
-            error=None if valid else "invalid signature",
+            trusted_alias=alias,
+            error=error,
         )
         chain.append(link)
-        if not valid:
+        if error is not None:
             return LineageResult(
                 verified=False, chain=chain,
-                error=f"ancestor at depth {link.depth} does not verify",
+                error=f"ancestor at depth {link.depth}: {error}",
             )
 
         seen.add(parent)

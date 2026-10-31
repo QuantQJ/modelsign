@@ -31,6 +31,7 @@ class SigFile:
     key_fingerprint: str
     identity: dict
     manifest: Optional[dict] = None
+    approvals: Optional[list] = None
 
 
 def write_sig(sig: SigFile, path: Path) -> None:
@@ -91,6 +92,7 @@ def read_sig(path: Path, validate_fingerprint: bool = False) -> SigFile:
         key_fingerprint=data["key_fingerprint"],
         identity=data["identity"],
         manifest=data.get("manifest"),
+        approvals=data.get("approvals"),
     )
 
     if validate_fingerprint:
@@ -129,10 +131,14 @@ def sig_digest(sig: "SigFile | Path | str") -> str:
 
     if not isinstance(sig, SigFile):
         sig = read_sig(Path(sig))
+
+    # Everything the signature is, except the approvals appended to it later —
+    # those must not change a digest that children already recorded. The full
+    # public key is included rather than the 8-hex display fingerprint, which
+    # is 32 bits and not collision-resistant.
     payload = {
-        "signature": sig.signature,
-        "sha256": sig.sha256,
-        "key_fingerprint": sig.key_fingerprint,
-        "identity": sig.identity,
+        k: v
+        for k, v in asdict(sig).items()
+        if k != "approvals" and v is not None
     }
     return "sha256:" + hashlib.sha256(canonical_json(payload)).hexdigest()
