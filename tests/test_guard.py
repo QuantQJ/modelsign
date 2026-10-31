@@ -12,7 +12,7 @@ import types
 import pytest
 
 from modelsign import guard
-from modelsign.api import default_sig_path, sign_model
+from modelsign.api import sign_model
 
 
 @pytest.fixture
