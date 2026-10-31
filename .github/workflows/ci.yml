@@ -8,10 +8,21 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # ubuntu-latest is Ubuntu 26.04, which has no Python 3.9, so that leg pins
+    # an older runner rather than dropping the version pyproject still claims.
+    runs-on: ${{ matrix.runner }}
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.9", "3.11", "3.12", "3.13"]
+        include:
+          - python-version: "3.9"
+            runner: ubuntu-24.04
+          - python-version: "3.11"
+            runner: ubuntu-latest
+          - python-version: "3.12"
+            runner: ubuntu-latest
+          - python-version: "3.13"
+            runner: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
