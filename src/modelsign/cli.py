@@ -1,31 +1,29 @@
 """Click-based CLI for modelsign — sign, verify, inspect AI models."""
 
-import base64
 import json
 import sys
-import time
 from pathlib import Path
 
 import click
 
 import modelsign
 from modelsign.crypto.keys import (
-    generate_keypair,
-    load_private_key,
-    load_public_key,
     compute_fingerprint,
-    public_key_to_bytes,
+    generate_keypair,
     keyring_add,
     keyring_list,
     keyring_remove,
+    load_private_key,
 )
-from modelsign.crypto.sign import sign_bytes, build_file_message, build_dir_message
-from modelsign.crypto.verify import verify_bytes
-from modelsign.formats.single import hash_file
-from modelsign.formats.directory import hash_directory
-from modelsign.identity.card import ModelCard, validate_card
-from modelsign.identity.canonical import canonical_json
-from modelsign.sig import SigFile, write_sig, read_sig
+from modelsign.sig import read_sig
+from modelsign.api import (
+    TRUST_EMBEDDED,
+    TRUST_PUBKEY,
+    VerifyError,
+    default_sig_path,
+    sign_model,
+    verify_model,
+)
 
 DEFAULT_KEY_DIR = Path.home() / ".modelsign"
 
@@ -125,92 +123,44 @@ def _find_pubkey_for_private(priv_path: Path) -> Path:
 def sign(model_path, name, identity_file, key_path, out_path):
     """Sign a model file or directory."""
     model_path = Path(model_path)
-    if not model_path.exists():
-        click.echo(f"Error: model not found: {model_path}", err=True)
-        sys.exit(1)
 
-    # Resolve private key
-    if key_path is not None:
-        priv_key_path = Path(key_path)
-    else:
-        priv_key_path = DEFAULT_KEY_DIR / "private.pem"
-        if not priv_key_path.exists():
-            click.echo(
-                f"Error: no key found at {priv_key_path}. Run 'modelsign keygen' first.",
-                err=True,
-            )
-            sys.exit(1)
-
-    try:
-        private_key = load_private_key(priv_key_path)
-    except Exception as e:
-        click.echo(f"Error loading private key: {e}", err=True)
-        sys.exit(1)
-
-    pub_key = private_key.public_key()
-    fingerprint = compute_fingerprint(pub_key)
-    pub_key_b64 = base64.b64encode(public_key_to_bytes(pub_key)).decode("ascii")
-
-    # Build identity card
+    card = None
     if identity_file is not None:
         try:
-            card_data = json.loads(Path(identity_file).read_text())
-            card = ModelCard.from_dict(card_data)
+            card = json.loads(Path(identity_file).read_text())
         except Exception as e:
             click.echo(f"Error reading identity file: {e}", err=True)
             sys.exit(1)
-    elif name is not None:
-        card = ModelCard(name=name)
-    else:
+    elif name is None:
         click.echo("Error: provide --name or --identity.", err=True)
         sys.exit(1)
 
+    sig_path = Path(out_path) if out_path else default_sig_path(model_path)
+
     try:
-        validate_card(card)
+        sig = sign_model(model_path, card=card, name=name, key=key_path, sig_path=sig_path)
     except ValueError as e:
         click.echo(f"Error: invalid identity card: {e}", err=True)
         sys.exit(1)
-
-    identity_dict = card.to_dict()
-    identity_bytes = canonical_json(identity_dict)
-
-    # Hash model and build message
-    manifest = None
-    if model_path.is_dir():
-        manifest, model_hash = hash_directory(model_path)
-        message = build_dir_message(model_hash, identity_bytes)
-        file_label = str(model_path)
-    else:
-        model_hash = hash_file(model_path)
-        message = build_file_message(model_hash, identity_bytes)
-        file_label = model_path.name
-
-    # Sign
-    signature_bytes = sign_bytes(message, private_key)
-    signature_b64 = base64.b64encode(signature_bytes).decode("ascii")
-
-    signed_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-    sig = SigFile(
-        modelsign_version="1.0",
-        file=file_label,
-        sha256=f"sha256:{model_hash}",
-        signature=signature_b64,
-        algorithm="ed25519",
-        signed_at=signed_at,
-        public_key=pub_key_b64,
-        key_fingerprint=fingerprint,
-        identity=identity_dict,
-        manifest=manifest,
-    )
-
-    sig_path = Path(out_path) if out_path else Path(str(model_path) + ".sig")
-    write_sig(sig, sig_path)
+    except Exception as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
 
     click.echo(f"Signed:      {model_path}")
     click.echo(f"Sig file:    {sig_path}")
-    click.echo(f"Fingerprint: {fingerprint}")
-    click.echo(f"SHA-256:     sha256:{model_hash[:16]}...")
+    click.echo(f"Fingerprint: {sig.key_fingerprint}")
+    click.echo(f"SHA-256:     {sig.sha256[:23]}...")
+
+
+_TRUST_LABELS = {
+    TRUST_PUBKEY: "TRUSTED (--pubkey)",
+    TRUST_EMBEDDED: "UNVERIFIED — using embedded key, not independently trusted",
+}
+
+_FAILURE_LINES = {
+    "hash mismatch": "Hash mismatch — file has been modified since signing.",
+    "invalid signature": "Invalid signature — sig file may have been tampered with.",
+}
 
 
 @main.command()
@@ -219,154 +169,78 @@ def sign(model_path, name, identity_file, key_path, out_path):
 @click.option("--pubkey", "pubkey_path", default=None, help="Path to trusted public key PEM.")
 @click.option("--json", "output_json", is_flag=True, default=False, help="Output JSON.")
 @click.option("--quiet", is_flag=True, default=False, help="Suppress output; use exit code only.")
-def verify(model_path, sig_path, pubkey_path, output_json, quiet):
+@click.option(
+    "--require-trusted",
+    is_flag=True,
+    default=False,
+    help="Fail unless the signing key is in the keyring or given with --pubkey.",
+)
+def verify(model_path, sig_path, pubkey_path, output_json, quiet, require_trusted):
     """Verify a signed model file or directory."""
     model_path = Path(model_path)
 
-    # Locate sig file
-    if sig_path is not None:
-        sig_file_path = Path(sig_path)
-    else:
-        sig_file_path = Path(str(model_path) + ".sig")
-
-    if not sig_file_path.exists():
-        if not quiet:
-            click.echo(f"Error: sig file not found: {sig_file_path}", err=True)
-        sys.exit(2)
-
-    if not model_path.exists():
-        if not quiet:
-            click.echo(f"Error: model not found: {model_path}", err=True)
-        sys.exit(2)
-
-    # Read sig (C2 fix: validate fingerprint matches embedded public key)
     try:
-        sig = read_sig(sig_file_path, validate_fingerprint=True)
-    except ValueError as e:
+        result = verify_model(
+            model_path,
+            sig_path=sig_path,
+            pubkey=pubkey_path,
+            require_trusted=require_trusted,
+        )
+    except VerifyError as e:
         if not quiet:
-            click.echo(f"FAILED {model_path.name}\n  Sig file corrupted: {e}", err=True)
-        sys.exit(1)
+            click.echo(f"Error: {e}", err=True)
+        sys.exit(2)
     except Exception as e:
         if not quiet:
-            click.echo(f"Error reading sig file: {e}", err=True)
+            click.echo(f"Error: {e}", err=True)
         sys.exit(2)
 
-    # Reconstruct public key for verification
-    # C3 fix: warn loudly when using embedded key (no independent trust verification)
-    using_trusted_key = False
-    try:
-        if pubkey_path is not None:
-            pub_key = load_public_key(Path(pubkey_path))
-            using_trusted_key = True
-        else:
-            # Check keyring for matching key
-            keyring_dir = DEFAULT_KEY_DIR / "keyring"
-            trusted_keys = keyring_list(keyring_dir)
-            matched_trust = None
-            for entry in trusted_keys:
-                if entry["fingerprint"] == sig.key_fingerprint:
-                    pub_key = load_public_key(Path(entry["path"]))
-                    using_trusted_key = True
-                    matched_trust = entry["alias"]
-                    break
-
-            if not using_trusted_key:
-                # Fall back to embedded key — but WARN the user
-                raw_pub = base64.b64decode(sig.public_key)
-                from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-                pub_key = Ed25519PublicKey.from_public_bytes(raw_pub)
-    except Exception as e:
-        if not quiet:
-            click.echo(f"Error loading public key: {e}", err=True)
-        sys.exit(2)
-
-    # Hash model
-    try:
-        if model_path.is_dir():
-            _, model_hash = hash_directory(model_path)
-        else:
-            model_hash = hash_file(model_path)
-    except Exception as e:
-        if not quiet:
-            click.echo(f"Error hashing model: {e}", err=True)
-        sys.exit(2)
-
-    # C1 fix: check file hash against sig BEFORE verifying signature
-    # sig.sha256 is stored as "sha256:<hex>", model_hash is raw hex
-    expected_hash = sig.sha256
-    if expected_hash.startswith("sha256:"):
-        expected_hash = expected_hash[7:]
-    if model_hash != expected_hash:
+    if not result.verified:
         if output_json:
-            click.echo(json.dumps({"verified": False, "error": "hash mismatch",
-                                   "detail": "file has been modified since signing"}))
+            click.echo(json.dumps({
+                "verified": False,
+                "error": result.error,
+                "detail": result.detail,
+            }))
         elif not quiet:
-            click.echo(f"FAILED {model_path.name}\n  Hash mismatch — file has been modified since signing.")
+            line = _FAILURE_LINES.get(result.error) or f"{result.error}: {result.detail}"
+            click.echo(f"FAILED {model_path.name}\n  {line}", err=result.error == "corrupted sig")
         sys.exit(1)
 
-    # Rebuild message and verify signature
-    identity_bytes = canonical_json(sig.identity)
-    if model_path.is_dir():
-        message = build_dir_message(model_hash, identity_bytes)
-    else:
-        message = build_file_message(model_hash, identity_bytes)
-
-    try:
-        signature_bytes = base64.b64decode(sig.signature)
-    except Exception as e:
-        if not quiet:
-            click.echo(f"Error decoding signature: {e}", err=True)
-        sys.exit(2)
-
-    ok = verify_bytes(message, signature_bytes, pub_key)
-
-    if not ok:
-        if output_json:
-            click.echo(json.dumps({"verified": False, "error": "invalid signature",
-                                   "detail": "signature or identity card has been tampered with"}))
-        elif not quiet:
-            click.echo(f"FAILED {model_path.name}\n  Invalid signature — sig file may have been tampered with.")
-        sys.exit(1)
-
-    # Determine trust level for display
-    fp = compute_fingerprint(pub_key)
-    if pubkey_path:
-        trust_label = "TRUSTED (--pubkey)"
-    elif using_trusted_key:
-        trust_label = f"TRUSTED (keyring: {matched_trust})"
-    else:
-        trust_label = "UNVERIFIED — using embedded key, not independently trusted"
+    trust_label = _TRUST_LABELS.get(result.trust) or f"TRUSTED (keyring: {result.trusted_alias})"
 
     if output_json:
-        result = {
+        click.echo(json.dumps({
             "verified": True,
-            "model": str(model_path),
-            "sha256": f"sha256:{model_hash}",
-            "fingerprint": fp,
+            "model": result.model,
+            "sha256": result.sha256,
+            "fingerprint": result.fingerprint,
             "trust": trust_label,
-            "signed_at": sig.signed_at,
-            "identity": sig.identity,
-        }
-        click.echo(json.dumps(result))
+            "signed_at": result.signed_at,
+            "identity": result.identity,
+        }))
         return
 
     if quiet:
         return
 
+    identity = result.identity
     click.echo(f"VERIFIED {model_path.name}")
-    click.echo(f"  Name:         {sig.identity.get('name', '(unnamed)')}")
-    if sig.identity.get("creator"):
-        click.echo(f"  Creator:      {sig.identity['creator']}")
-    if sig.identity.get("architecture"):
-        click.echo(f"  Architecture: {sig.identity['architecture']}")
-    if sig.identity.get("base_model"):
-        click.echo(f"  Base model:   {sig.identity['base_model']}")
-    if sig.identity.get("license"):
-        click.echo(f"  License:      {sig.identity['license']}")
-    click.echo(f"  Signed:       {sig.signed_at} (unverified — no RFC 3161 timestamp)")
-    click.echo(f"  Key:          {fp} ({trust_label})")
-    if not using_trusted_key:
-        click.echo(f"  WARNING: key not in keyring. Run 'modelsign keyring add <pubkey> <alias>' to trust it.")
+    click.echo(f"  Name:         {identity.get('name', '(unnamed)')}")
+    for label, field_name in (
+        ("Creator", "creator"),
+        ("Architecture", "architecture"),
+        ("Base model", "base_model"),
+        ("License", "license"),
+    ):
+        if identity.get(field_name):
+            click.echo(f"  {label + ':':<13} {identity[field_name]}")
+    click.echo(f"  Signed:       {result.signed_at} (unverified — no RFC 3161 timestamp)")
+    click.echo(f"  Key:          {result.fingerprint} ({trust_label})")
+    if not result.trusted:
+        click.echo("  WARNING: key not in keyring. Run 'modelsign keyring add <pubkey> <alias>' to trust it.")
+
+
 
 
 @main.command()
@@ -451,3 +325,95 @@ def keyring_remove_cmd(alias, keyring_dir):
     except Exception as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
+
+
+@main.group()
+def oms():
+    """Interoperate with OpenSSF Model Signing (OMS).
+
+    OMS signatures are Sigstore bundles produced by the `model-signing`
+    package. Signing uses ECDSA P-256 keys, because that verifier rejects
+    Ed25519 — generate one with `modelsign oms keygen`.
+    """
+
+
+@oms.command("keygen")
+@click.option("--dir", "key_dir", default=None, help="Where to write the keypair.")
+def oms_keygen(key_dir):
+    """Generate an ECDSA P-256 keypair for OMS signing."""
+    from modelsign.oms import generate_ec_keypair
+
+    priv, pub = generate_ec_keypair(Path(key_dir) if key_dir else DEFAULT_KEY_DIR)
+    click.echo(f"Private key: {priv}")
+    click.echo(f"Public key:  {pub}")
+
+
+@oms.command("export")
+@click.argument("model_path")
+@click.option("--key", "key_path", required=True, help="ECDSA private key PEM.")
+@click.option("--out", default=None, help="Bundle path (default: model.sig beside the model).")
+@click.option("--name", default=None, help="Model name recorded in the statement.")
+@click.option("--allow-symlinks", is_flag=True, default=False, help="Follow symlinks.")
+def oms_export(model_path, key_path, out, name, allow_symlinks):
+    """Sign a model into an OMS bundle any OMS verifier can read."""
+    from modelsign.oms import DEFAULT_BUNDLE_NAME, OMSError, export_bundle
+
+    try:
+        export_bundle(
+            model_path,
+            key=key_path,
+            name=name,
+            out=out,
+            allow_symlinks=allow_symlinks,
+        )
+    except (OMSError, VerifyError) as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+    bundle = out or str(Path(model_path).parent / DEFAULT_BUNDLE_NAME)
+    click.echo(f"Signed:  {model_path}")
+    click.echo(f"Bundle:  {bundle}")
+    click.echo("Format:  OpenSSF Model Signing (sigstore bundle, DSSE, in-toto)")
+
+
+@oms.command("verify")
+@click.argument("model_path")
+@click.option("--bundle", "bundle_path", default=None, help="Bundle path (default: model.sig).")
+@click.option("--pubkey", "pubkey_path", required=True, help="ECDSA public key PEM.")
+@click.option("--json", "output_json", is_flag=True, default=False, help="Output JSON.")
+@click.option("--quiet", is_flag=True, default=False, help="Exit code only.")
+def oms_verify(model_path, bundle_path, pubkey_path, output_json, quiet):
+    """Verify a model against an OMS bundle."""
+    from modelsign.oms import DEFAULT_BUNDLE_NAME, OMSError, verify_bundle
+
+    model_path = Path(model_path)
+    bundle = Path(bundle_path) if bundle_path else model_path / DEFAULT_BUNDLE_NAME
+    if not bundle.exists() and not bundle_path:
+        bundle = model_path.parent / DEFAULT_BUNDLE_NAME
+
+    try:
+        result = verify_bundle(model_path, bundle, pubkey=pubkey_path)
+    except (OMSError, VerifyError) as e:
+        if not quiet:
+            click.echo(f"Error: {e}", err=True)
+        sys.exit(2)
+
+    if output_json:
+        click.echo(json.dumps({
+            "verified": result.verified,
+            "model": result.model,
+            "sha256": result.sha256,
+            "error": result.error,
+            "detail": result.detail,
+            "identity": result.identity,
+        }))
+    elif not quiet:
+        if result.verified:
+            click.echo(f"VERIFIED {model_path.name}")
+            click.echo(f"  Name:    {result.identity.get('name')}")
+            click.echo("  Format:  OpenSSF Model Signing")
+            click.echo(f"  Digest:  {result.sha256}")
+        else:
+            click.echo(f"FAILED {model_path.name}\n  {result.error}: {result.detail}")
+
+    sys.exit(0 if result.verified else 1)
