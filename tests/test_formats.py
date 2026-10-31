@@ -58,3 +58,36 @@ def test_hash_directory_detects_change(tmp_model_dir):
 def test_hash_directory_not_found(tmp_path):
     with pytest.raises(FileNotFoundError):
         hash_directory(tmp_path / "nonexistent_dir")
+
+
+def test_parallel_hashing_matches_serial_exactly(tmp_path):
+    """Concurrency must not change the manifest, or every signature breaks."""
+    from modelsign.formats.directory import hash_directory
+
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "sub").mkdir()
+    for i in range(12):
+        (model / f"shard-{i:05d}.safetensors").write_bytes(f"weights-{i}".encode() * 64)
+    (model / "sub" / "nested.json").write_bytes(b'{"a":1}')
+    (model / "config.json").write_bytes(b'{"model_type":"llama"}')
+
+    serial_manifest, serial_hash = hash_directory(model, max_workers=1)
+    parallel_manifest, parallel_hash = hash_directory(model, max_workers=8)
+
+    assert parallel_manifest == serial_manifest
+    assert parallel_hash == serial_hash
+    # and the order in the manifest is the sorted order, not completion order
+    assert list(parallel_manifest["files"]) == sorted(serial_manifest["files"])
+
+
+def test_parallel_hashing_is_stable_across_runs(tmp_path):
+    from modelsign.formats.directory import hash_directory
+
+    model = tmp_path / "model"
+    model.mkdir()
+    for i in range(8):
+        (model / f"f{i}.bin").write_bytes(bytes([i]) * 1024)
+
+    hashes = {hash_directory(model)[1] for _ in range(5)}
+    assert len(hashes) == 1

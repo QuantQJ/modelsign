@@ -20,6 +20,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -29,6 +31,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
 from modelsign.api import TRUST_PUBKEY, VerifyError, VerifyResult
+from modelsign.formats.directory import PARALLEL_THRESHOLD
 from modelsign.formats.single import hash_file
 
 BUNDLE_MEDIA_TYPE = "application/vnd.dev.sigstore.bundle.v0.3+json"
@@ -167,7 +170,7 @@ def collect_resources(
     if model_path.is_file():
         return [Resource(name=model_path.name, digest=hash_file(model_path))]
 
-    resources = []
+    wanted = []
     for path in model_path.rglob("*"):
         if not path.is_file():
             continue
@@ -179,10 +182,16 @@ def collect_resources(
         rel = path.relative_to(model_path)
         if _ignored(rel, ignore_paths):
             continue
-        resources.append(Resource(name=rel.as_posix(), digest=hash_file(path)))
+        wanted.append((rel.as_posix(), path))
 
-    resources.sort(key=lambda r: r.name)
-    return resources
+    wanted.sort(key=lambda pair: pair[0])
+    if len(wanted) >= PARALLEL_THRESHOLD:
+        with ThreadPoolExecutor(max_workers=max(1, min(len(wanted), os.cpu_count() or 1))) as pool:
+            digests = list(pool.map(lambda pair: hash_file(pair[1]), wanted))
+    else:
+        digests = [hash_file(path) for _, path in wanted]
+
+    return [Resource(name=name, digest=digest) for (name, _), digest in zip(wanted, digests)]
 
 
 def build_statement(
