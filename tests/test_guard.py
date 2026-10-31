@@ -1,0 +1,338 @@
+"""Tests for load-time verification.
+
+A stand-in huggingface_hub module keeps these tests offline: it serves files
+from a local directory the way the real download functions serve them from
+the Hub cache.
+"""
+
+import shutil
+import sys
+import types
+
+import pytest
+
+from modelsign import guard
+from modelsign.api import default_sig_path, sign_model
+
+
+@pytest.fixture
+def fake_hub(tmp_path, monkeypatch):
+    """A module named huggingface_hub whose downloads come from a local repo dir."""
+    repo = tmp_path / "remote-repo"
+    repo.mkdir()
+    cache = tmp_path / "cache"
+    cache.mkdir()
+
+    module = types.ModuleType("huggingface_hub")
+
+    def hf_hub_download(repo_id, filename, **kwargs):
+        src = repo / filename
+        if not src.exists():
+            raise FileNotFoundError(f"404 {repo_id}/{filename}")
+        dst = cache / filename
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        return str(dst)
+
+    def snapshot_download(repo_id, **kwargs):
+        dst = cache / "snapshot"
+        if dst.exists():
+            shutil.rmtree(dst)
+        shutil.copytree(repo, dst)
+        repo_sig = repo.parent / (repo.name + ".sig")
+        if repo_sig.exists():
+            shutil.copy2(repo_sig, str(dst) + ".sig")
+        return str(dst)
+
+    module.hf_hub_download = hf_hub_download
+    module.snapshot_download = snapshot_download
+    monkeypatch.setitem(sys.modules, "huggingface_hub", module)
+
+    yield types.SimpleNamespace(module=module, repo=repo, cache=cache)
+    guard.uninstall()
+
+
+def _publish(fake, keypair, name="model.safetensors", sign=True):
+    """Put a model in the fake repo, signed by default."""
+    path = fake.repo / name
+    path.write_bytes(b"weights-" + name.encode())
+    if sign:
+        sign_model(path, name="Published-Model", key=keypair["private"])
+    return path
+
+
+# -- require_verified ---------------------------------------------------
+
+
+def test_require_verified_passes_signed_model(tmp_keypair, tmp_model_file):
+    sign_model(tmp_model_file, name="Test-Model", key=tmp_keypair["private"])
+    result = guard.require_verified(tmp_model_file, pubkey=tmp_keypair["public"])
+    assert result.verified
+
+
+def test_require_verified_blocks_modified_model(tmp_keypair, tmp_model_file):
+    sign_model(tmp_model_file, name="Test-Model", key=tmp_keypair["private"])
+    tmp_model_file.write_bytes(b"swapped-weights")
+    with pytest.raises(guard.LoadBlocked) as excinfo:
+        guard.require_verified(tmp_model_file, pubkey=tmp_keypair["public"])
+    assert "hash mismatch" in str(excinfo.value)
+    assert excinfo.value.result.error == "hash mismatch"
+
+
+def test_require_verified_blocks_unknown_signer(tmp_keypair, tmp_model_file, tmp_path):
+    sign_model(tmp_model_file, name="Test-Model", key=tmp_keypair["private"])
+    with pytest.raises(guard.LoadBlocked):
+        guard.require_verified(tmp_model_file, keyring_dir=tmp_path / "empty")
+
+
+def test_require_verified_allows_embedded_when_asked(
+    tmp_keypair, tmp_model_file, tmp_path
+):
+    sign_model(tmp_model_file, name="Test-Model", key=tmp_keypair["private"])
+    result = guard.require_verified(
+        tmp_model_file, keyring_dir=tmp_path / "empty", allow_embedded=True
+    )
+    assert result.verified
+    assert result.trusted is False
+
+
+def test_require_verified_blocks_missing_signature(tmp_model_file):
+    with pytest.raises(guard.LoadBlocked):
+        guard.require_verified(tmp_model_file)
+
+
+# -- hub patching -------------------------------------------------------
+
+
+def test_install_is_idempotent_and_reversible(fake_hub):
+    original = fake_hub.module.hf_hub_download
+    guard.install(allow_unsigned=True)
+    guard.install(allow_unsigned=True)
+    assert guard.is_installed()
+    assert fake_hub.module.hf_hub_download is not original
+    guard.uninstall()
+    assert not guard.is_installed()
+    assert fake_hub.module.hf_hub_download is original
+
+
+def test_guarded_download_returns_signed_file(fake_hub, tmp_keypair):
+    _publish(fake_hub, tmp_keypair)
+    guard.install(pubkey=tmp_keypair["public"])
+    path = fake_hub.module.hf_hub_download("acme/model", "model.safetensors")
+    assert path.endswith("model.safetensors")
+
+
+def test_guarded_download_fetches_sig_from_repo(fake_hub, tmp_keypair):
+    _publish(fake_hub, tmp_keypair)
+    guard.install(pubkey=tmp_keypair["public"])
+    fake_hub.module.hf_hub_download("acme/model", "model.safetensors")
+    # The signature was pulled alongside the weights, not assumed present.
+    assert (fake_hub.cache / "model.safetensors.sig").exists()
+
+
+def test_guarded_download_blocks_unsigned_weights(fake_hub, tmp_keypair):
+    _publish(fake_hub, tmp_keypair, name="naked.safetensors", sign=False)
+    guard.install(pubkey=tmp_keypair["public"])
+    with pytest.raises(guard.LoadBlocked) as excinfo:
+        fake_hub.module.hf_hub_download("acme/model", "naked.safetensors")
+    assert "no signature" in str(excinfo.value)
+
+
+def test_allow_unsigned_lets_unsigned_weights_through(fake_hub, tmp_keypair):
+    _publish(fake_hub, tmp_keypair, name="naked.safetensors", sign=False)
+    guard.install(pubkey=tmp_keypair["public"], allow_unsigned=True)
+    path = fake_hub.module.hf_hub_download("acme/model", "naked.safetensors")
+    assert path.endswith("naked.safetensors")
+
+
+def test_guarded_download_blocks_tampered_weights(fake_hub, tmp_keypair):
+    path = _publish(fake_hub, tmp_keypair)
+    path.write_bytes(b"swapped-after-signing")
+    guard.install(pubkey=tmp_keypair["public"])
+    with pytest.raises(guard.LoadBlocked):
+        fake_hub.module.hf_hub_download("acme/model", "model.safetensors")
+
+
+def test_guarded_download_blocks_signature_from_unknown_key(
+    fake_hub, tmp_keypair, tmp_path
+):
+    _publish(fake_hub, tmp_keypair)
+    guard.install(keyring_dir=tmp_path / "empty")
+    with pytest.raises(guard.LoadBlocked):
+        fake_hub.module.hf_hub_download("acme/model", "model.safetensors")
+
+
+def test_env_var_supplies_the_trusted_key(fake_hub, tmp_keypair, monkeypatch):
+    _publish(fake_hub, tmp_keypair)
+    monkeypatch.setenv("MODELSIGN_PUBKEY", str(tmp_keypair["public"]))
+    guard.install()
+    assert fake_hub.module.hf_hub_download("acme/model", "model.safetensors")
+
+
+def test_guarded_snapshot_verifies_each_signed_file(fake_hub, tmp_keypair):
+    _publish(fake_hub, tmp_keypair, name="a.safetensors")
+    _publish(fake_hub, tmp_keypair, name="b.safetensors")
+    guard.install(pubkey=tmp_keypair["public"])
+    local = fake_hub.module.snapshot_download("acme/model")
+    assert local.endswith("snapshot")
+
+
+def test_guarded_snapshot_blocks_one_tampered_shard(fake_hub, tmp_keypair):
+    _publish(fake_hub, tmp_keypair, name="a.safetensors")
+    bad = _publish(fake_hub, tmp_keypair, name="b.safetensors")
+    bad.write_bytes(b"swapped-after-signing")
+    guard.install(pubkey=tmp_keypair["public"])
+    with pytest.raises(guard.LoadBlocked):
+        fake_hub.module.snapshot_download("acme/model")
+
+
+def test_guarded_snapshot_blocks_wholly_unsigned_repo(fake_hub, tmp_keypair):
+    _publish(fake_hub, tmp_keypair, name="a.safetensors", sign=False)
+    guard.install(pubkey=tmp_keypair["public"])
+    with pytest.raises(guard.LoadBlocked):
+        fake_hub.module.snapshot_download("acme/model")
+
+
+# -- the snapshot path must not verify only the files that happen to be signed
+
+
+def test_guarded_snapshot_blocks_unsigned_file_beside_signed_one(fake_hub, tmp_keypair):
+    """A signed model next to an unsigned file must not let the pair through."""
+    _publish(fake_hub, tmp_keypair, name="model.safetensors")
+    _publish(fake_hub, tmp_keypair, name="pytorch_model.bin", sign=False)
+    guard.install(pubkey=tmp_keypair["public"])
+    with pytest.raises(guard.LoadBlocked) as excinfo:
+        fake_hub.module.snapshot_download("acme/model")
+    assert "pytorch_model.bin" in str(excinfo.value)
+
+
+def test_guarded_snapshot_names_every_unsigned_file(fake_hub, tmp_keypair):
+    _publish(fake_hub, tmp_keypair, name="model.safetensors")
+    _publish(fake_hub, tmp_keypair, name="sneaky.pkl", sign=False)
+    _publish(fake_hub, tmp_keypair, name="also_sneaky.bin", sign=False)
+    guard.install(pubkey=tmp_keypair["public"])
+    with pytest.raises(guard.LoadBlocked) as excinfo:
+        fake_hub.module.snapshot_download("acme/model")
+    message = str(excinfo.value)
+    assert "sneaky.pkl" in message and "also_sneaky.bin" in message
+
+
+def test_guarded_snapshot_blocks_unsigned_file_in_subdirectory(fake_hub, tmp_keypair):
+    _publish(fake_hub, tmp_keypair, name="model.safetensors")
+    nested = fake_hub.repo / "onnx"
+    nested.mkdir()
+    (nested / "model.onnx").write_bytes(b"unsigned-nested-weights")
+    guard.install(pubkey=tmp_keypair["public"])
+    with pytest.raises(guard.LoadBlocked) as excinfo:
+        fake_hub.module.snapshot_download("acme/model")
+    assert "onnx/model.onnx" in str(excinfo.value)
+
+
+def test_whole_directory_signature_covers_unsigned_files(fake_hub, tmp_keypair):
+    """A directory signature's manifest covers every file, so no per-file sigs needed."""
+    (fake_hub.repo / "config.json").write_bytes(b'{"model_type":"llama"}')
+    (fake_hub.repo / "model.safetensors").write_bytes(b"weights")
+    sign_model(
+        fake_hub.repo,
+        name="Whole-Repo",
+        key=tmp_keypair["private"],
+        sig_path=str(fake_hub.repo) + ".sig",
+    )
+    guard.install(pubkey=tmp_keypair["public"])
+    assert fake_hub.module.snapshot_download("acme/model")
+
+
+def test_whole_directory_signature_catches_an_added_file(fake_hub, tmp_keypair):
+    (fake_hub.repo / "model.safetensors").write_bytes(b"weights")
+    sign_model(
+        fake_hub.repo,
+        name="Whole-Repo",
+        key=tmp_keypair["private"],
+        sig_path=str(fake_hub.repo) + ".sig",
+    )
+    (fake_hub.repo / "smuggled.pkl").write_bytes(b"added-after-signing")
+    guard.install(pubkey=tmp_keypair["public"])
+    with pytest.raises(guard.LoadBlocked):
+        fake_hub.module.snapshot_download("acme/model")
+
+
+def test_allow_unsigned_still_bypasses_the_snapshot_check(fake_hub, tmp_keypair):
+    _publish(fake_hub, tmp_keypair, name="model.safetensors")
+    _publish(fake_hub, tmp_keypair, name="extra.bin", sign=False)
+    guard.install(pubkey=tmp_keypair["public"], allow_unsigned=True)
+    assert fake_hub.module.snapshot_download("acme/model")
+
+
+# -- OMS bundles are honoured at the same chokepoint
+
+
+@pytest.fixture
+def ec_pub(tmp_path):
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    priv, pub = tmp_path / "oms_priv.pem", tmp_path / "oms_pub.pem"
+    priv.write_bytes(key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ))
+    pub.write_bytes(key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    ))
+    return {"private": priv, "public": pub}
+
+
+def _publish_oms(fake_hub, ec_pub):
+    """Sign the fake repo into an OMS bundle at the conventional path."""
+    from modelsign.oms import DEFAULT_BUNDLE_NAME, export_bundle
+
+    (fake_hub.repo / "model.safetensors").write_bytes(b"oms-weights")
+    (fake_hub.repo / "config.json").write_bytes(b'{"model_type":"llama"}')
+    export_bundle(
+        fake_hub.repo,
+        key=ec_pub["private"],
+        name="acme/model",
+        out=fake_hub.repo / DEFAULT_BUNDLE_NAME,
+    )
+
+
+def test_guard_accepts_an_oms_signed_snapshot(fake_hub, ec_pub):
+    _publish_oms(fake_hub, ec_pub)
+    guard.install(oms_pubkey=ec_pub["public"])
+    assert fake_hub.module.snapshot_download("acme/model")
+
+
+def test_guard_blocks_a_tampered_oms_snapshot(fake_hub, ec_pub):
+    _publish_oms(fake_hub, ec_pub)
+    (fake_hub.repo / "model.safetensors").write_bytes(b"swapped-after-signing")
+    guard.install(oms_pubkey=ec_pub["public"])
+    with pytest.raises(guard.LoadBlocked) as excinfo:
+        fake_hub.module.snapshot_download("acme/model")
+    assert "hash mismatch" in str(excinfo.value)
+
+
+def test_guard_blocks_a_file_smuggled_into_an_oms_snapshot(fake_hub, ec_pub):
+    _publish_oms(fake_hub, ec_pub)
+    (fake_hub.repo / "smuggled.pkl").write_bytes(b"not in the manifest")
+    guard.install(oms_pubkey=ec_pub["public"])
+    with pytest.raises(guard.LoadBlocked) as excinfo:
+        fake_hub.module.snapshot_download("acme/model")
+    assert "smuggled.pkl" in str(excinfo.value)
+
+
+def test_oms_bundle_is_ignored_without_a_configured_key(fake_hub, ec_pub, tmp_keypair):
+    """An OMS bundle we have no key for must not count as a signature."""
+    _publish_oms(fake_hub, ec_pub)
+    guard.install(pubkey=tmp_keypair["public"])
+    with pytest.raises(guard.LoadBlocked):
+        fake_hub.module.snapshot_download("acme/model")
+
+
+def test_oms_env_var_supplies_the_key(fake_hub, ec_pub, monkeypatch):
+    _publish_oms(fake_hub, ec_pub)
+    monkeypatch.setenv("MODELSIGN_OMS_PUBKEY", str(ec_pub["public"]))
+    guard.install()
+    assert fake_hub.module.snapshot_download("acme/model")
