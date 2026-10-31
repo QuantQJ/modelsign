@@ -332,3 +332,102 @@ def test_a_quorum_counts_distinct_approvers(signed, approver):
             default_sig_path(signed), count=2, pubkeys=[approver["public"]]
         )
     assert "distinct" in str(excinfo.value)
+
+
+# -- one key is one approver, however it is encoded
+
+
+def test_one_key_cannot_pad_a_quorum_with_re_encodings(signed, approver, tmp_path):
+    """base64 leaves unused bits, so one key has four encodings.
+
+    Counting distinct approvers on the encoded string would let a single
+    approver satisfy a four-person quorum.
+    """
+    import base64
+    import string
+
+    approve(signed, key=approver["private"], role="build")
+    sig_path = default_sig_path(signed)
+    data = json.loads(sig_path.read_text())
+    record = data["approvals"][0]
+    canonical = record["public_key"]
+    raw = base64.b64decode(canonical)
+
+    alphabet = string.ascii_uppercase + string.ascii_lowercase + string.digits + "+/"
+    variants = [
+        canonical[:-2] + ch + "="
+        for ch in alphabet
+        if canonical[:-2] + ch + "=" != canonical
+        and base64.b64decode(canonical[:-2] + ch + "=", validate=True) == raw
+    ]
+    assert variants, "expected non-canonical encodings of the same key to exist"
+
+    for position, variant in enumerate(variants, start=1):
+        clone = dict(record)
+        clone["public_key"] = variant
+        clone["role"] = f"role-{position}"
+        data["approvals"].append(clone)
+    sig_path.write_text(json.dumps(data))
+
+    approvals = read_approvals(sig_path, pubkeys=[approver["public"]])
+    # the re-encoded clones are refused outright
+    assert all(not a.valid for a in approvals[1:])
+    with pytest.raises(ApprovalError):
+        require_approval(sig_path, count=2, pubkeys=[approver["public"]])
+
+
+def test_a_non_canonical_key_encoding_is_refused(signed, approver):
+    import base64
+
+    approve(signed, key=approver["private"], role="build")
+    sig_path = default_sig_path(signed)
+    data = json.loads(sig_path.read_text())
+    canonical = data["approvals"][0]["public_key"]
+    raw = base64.b64decode(canonical)
+    for ch in "ABCDEFGHIJKLMNOP":
+        candidate = canonical[:-2] + ch + "="
+        if candidate != canonical and base64.b64decode(candidate, validate=True) == raw:
+            data["approvals"][0]["public_key"] = candidate
+            break
+    else:
+        pytest.skip("no non-canonical encoding available for this key")
+
+    sig_path.write_text(json.dumps(data))
+    assert read_approvals(sig_path, pubkeys=[approver["public"]])[0].valid is False
+
+
+def test_approvers_can_be_pinned_by_key(signed, approver, tmp_path):
+    other = Ed25519PrivateKey.generate()
+    other_priv = tmp_path / "other.pem"
+    other_pub = tmp_path / "other_pub.pem"
+    other_priv.write_bytes(other.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ))
+    other_pub.write_bytes(other.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    ))
+
+    approve(signed, key=other_priv, role="release-manager")
+    trusted = [approver["public"], other_pub]
+
+    assert require_approval(
+        default_sig_path(signed), keys=[other_pub], pubkeys=trusted
+    )
+    with pytest.raises(ApprovalError):
+        require_approval(
+            default_sig_path(signed), keys=[approver["public"]], pubkeys=trusted
+        )
+
+
+def test_pinning_by_display_fingerprint_is_refused(signed, approver):
+    approve(signed, key=approver["private"], role="build")
+    with pytest.raises(ApprovalError) as excinfo:
+        require_approval(
+            default_sig_path(signed),
+            keys=["ed25519:deadbeef"],
+            pubkeys=[approver["public"]],
+        )
+    assert "not an identity" in str(excinfo.value)

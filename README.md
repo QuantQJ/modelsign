@@ -172,12 +172,15 @@ because approvals are appended after it was made. The answer is policy at
 verification time — `--require-approval`, `--min-approvals` — or an external
 anchor such as a transparency log, not a cleverer signature.
 
-Trust is decided on a **whole public key**, never on the 8-character display
-fingerprint: 32 bits is cheap to collide, and an approval from a ground key
-must not inherit an approver's trust. Every role passed to
-`--require-approval` must be satisfied, not merely one of them, and
-`--min-approvals` counts **distinct** approvers — one person in two roles is
-one person.
+Identity is compared on **whole key bytes** throughout — never the
+8-character display fingerprint (32 bits is cheap to collide), and never the
+base64 string, since base64 leaves unused bits and one key has four encodings
+that all decode alike. A non-canonical encoding is refused rather than counted.
+
+Every role passed to `--require-approval` must be satisfied, not merely one of
+them, and `--min-approvals` counts **distinct** approvers: one person in two
+roles is one person. Pinning specific approvers (`require_approval(keys=...)`)
+takes public key PEM paths or key bytes, not fingerprints.
 
 ## OpenSSF Model Signing interoperability
 

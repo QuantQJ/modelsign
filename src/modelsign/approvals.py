@@ -114,7 +114,12 @@ class Approval:
     approver: str
     approved_at: str
     key_fingerprint: str
+    raw_key: bytes = b""
+    """The approver's key as bytes — the only safe identity to compare on."""
+
     public_key: str = ""
+    """The key re-encoded canonically from :attr:`raw_key`, for display."""
+
     index: int = 0
     valid: bool = False
     trusted: bool = False
@@ -273,7 +278,15 @@ def read_approvals(
             error = "signed over a different signature"
         else:
             try:
-                raw_key = base64.b64decode(record["public_key"])
+                encoded = record["public_key"]
+                raw_key = base64.b64decode(encoded, validate=True)
+                # base64 leaves unused bits in the final character, so one key
+                # has several encodings that all decode alike. Counting
+                # distinct approvers on the string would let one of them
+                # appear as four, so a non-canonical encoding is refused.
+                if len(raw_key) != 32 or base64.b64encode(raw_key).decode() != encoded:
+                    raw_key = b""
+                    raise ValueError("non-canonical public key encoding")
                 key = Ed25519PublicKey.from_public_bytes(raw_key)
                 valid = compute_fingerprint(key) == fingerprint and verify_bytes(
                     build_approval_message(
@@ -313,7 +326,8 @@ def read_approvals(
                 approved_at=approved_at,
                 key_fingerprint=fingerprint,
                 index=int(index) if str(index).lstrip("-").isdigit() else position,
-                public_key=record.get("public_key", ""),
+                raw_key=raw_key,
+                public_key=base64.b64encode(raw_key).decode() if raw_key else "",
                 valid=valid,
                 trusted=valid and chain_ok and raw_key in trusted,
                 trusted_alias=trusted.get(raw_key) if valid and chain_ok else None,
@@ -329,7 +343,7 @@ def read_approvals(
 def require_approval(
     sig: SigFile | Path | str,
     *,
-    fingerprints: Iterable[str] = (),
+    keys: Iterable[Path | str | bytes] = (),
     roles: Iterable[str] = (),
     count: int = 1,
     pubkeys: Iterable[Path | str] = (),
@@ -342,17 +356,37 @@ def require_approval(
     that arrived with the model proves nothing.
 
     Every role in ``roles`` must be satisfied, not merely one of them, and
-    ``count`` counts **distinct** approvers: two approvals from one key are one
-    person however many roles they are recorded under.
+    ``count`` counts **distinct** approvers, compared on key bytes: two
+    approvals from one key are one person however many roles they are recorded
+    under, and however the key is encoded.
+
+    ``keys`` pins the approvers allowed to satisfy the policy, as PEM paths or
+    raw key bytes. It deliberately does not accept a display fingerprint —
+    those are 32 bits and not an identity.
     """
     approvals = read_approvals(sig, pubkeys=pubkeys, keyring_dir=keyring_dir)
     usable = [a for a in approvals if a.ok]
 
     wanted_roles = list(dict.fromkeys(roles))
-    wanted_keys = {f for f in fingerprints}
+
+    wanted_keys = set()
+    for entry in keys:
+        if isinstance(entry, bytes):
+            wanted_keys.add(entry)
+            continue
+        text = str(entry)
+        if text.startswith("ed25519:"):
+            raise ApprovalError(
+                f"{text!r} is a display fingerprint, not an identity; pin an "
+                "approver by public key PEM path or key bytes"
+            )
+        try:
+            wanted_keys.add(public_key_to_bytes(load_public_key(Path(text).expanduser())))
+        except Exception as e:
+            raise ApprovalError(f"could not load approver key {text}: {e}") from e
 
     if wanted_keys:
-        usable = [a for a in usable if a.key_fingerprint in wanted_keys]
+        usable = [a for a in usable if a.raw_key in wanted_keys]
 
     # Every role asked for has to be satisfied, not any one of them.
     missing = [role for role in wanted_roles if not any(a.role == role for a in usable)]
@@ -369,13 +403,13 @@ def require_approval(
 
     # A quorum counts distinct signing identities. Two approvals from one key,
     # in two roles, are one person.
-    distinct = {a.public_key for a in usable if a.public_key}
+    distinct = {a.raw_key for a in usable if a.raw_key}
     if len(distinct) < count:
         detail = []
         if wanted_roles:
             detail.append("role in " + ", ".join(sorted(wanted_roles)))
         if wanted_keys:
-            detail.append("key in " + ", ".join(sorted(wanted_keys)))
+            detail.append(f"one of {len(wanted_keys)} pinned key(s)")
         constraint = (" (" + "; ".join(detail) + ")") if detail else ""
         raise ApprovalError(
             f"needed {count} distinct trusted approver(s){constraint}, "
