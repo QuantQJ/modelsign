@@ -401,3 +401,40 @@ def test_guard_rejects_an_unbound_name_by_default(fake_hub, tmp_keypair, tmp_pat
     assert guard.require_verified(
         model, pubkey=tmp_keypair["public"], allow_unbound_names=True
     ).verified
+
+
+def test_per_file_mode_refuses_duplicate_basenames(fake_hub, tmp_keypair):
+    """Basename-only binding makes same-named files in different dirs swappable."""
+    _publish(fake_hub, tmp_keypair, name="model.safetensors")
+    nested = fake_hub.repo / "onnx"
+    nested.mkdir()
+    target = nested / "model.safetensors"
+    target.write_bytes(b"different-weights")
+    from modelsign.api import sign_model
+
+    sign_model(target, name="Published-Model", key=tmp_keypair["private"])
+
+    guard.install(pubkey=tmp_keypair["public"])
+    with pytest.raises(guard.LoadBlocked) as excinfo:
+        fake_hub.module.snapshot_download("acme/model")
+    message = str(excinfo.value)
+    assert "basename only" in message
+    assert "onnx/model.safetensors" in message
+
+
+def test_directory_signature_has_no_basename_ambiguity(fake_hub, tmp_keypair):
+    """The same layout verifies fine under a directory signature."""
+    from modelsign.api import sign_model
+
+    (fake_hub.repo / "model.safetensors").write_bytes(b"weights")
+    nested = fake_hub.repo / "onnx"
+    nested.mkdir()
+    (nested / "model.safetensors").write_bytes(b"different-weights")
+    sign_model(
+        fake_hub.repo,
+        name="Whole-Repo",
+        key=tmp_keypair["private"],
+        sig_path=str(fake_hub.repo) + ".sig",
+    )
+    guard.install(pubkey=tmp_keypair["public"])
+    assert fake_hub.module.snapshot_download("acme/model")

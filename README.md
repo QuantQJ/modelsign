@@ -71,6 +71,12 @@ editing that field. A directory signature does not need this — its manifest
 hash already covers every relative path, which is also why a snapshot
 verifies under whatever directory name it lands in.
 
+A single-file signature authenticates the file's **basename**, not the path it
+sits at — a publisher signing one file cannot know where a consumer will place
+it. So prefer a directory signature for a multi-file model: the guard refuses
+a snapshot whose per-file signatures share a basename across directories,
+because those files would be interchangeable.
+
 1.x signatures still verify, and `VerifyResult.name_bound` tells you which
 kind you have. `verify_model(..., require_name_binding=True)` rejects 1.x,
 and `guard.install()` does so by default for single files — pass

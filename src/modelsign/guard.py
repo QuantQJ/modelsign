@@ -168,6 +168,30 @@ class _HubGuard:
             if unsigned:
                 self._unsigned(local, unsigned)
                 return str(local)
+
+            # A single-file signature authenticates the basename, not the path
+            # it sits at, so two files sharing a basename in different
+            # directories could be swapped for each other. A directory
+            # signature has no such gap; refuse the ambiguity instead.
+            by_basename: dict[str, list[Path]] = {}
+            for f in files:
+                by_basename.setdefault(f.name, []).append(f)
+            clashes = {
+                name: paths for name, paths in by_basename.items() if len(paths) > 1
+            }
+            if clashes and not self.allow_unsigned:
+                detail = "; ".join(
+                    f"{name} at " + ", ".join(
+                        sorted(p.relative_to(local).as_posix() for p in paths)
+                    )
+                    for name, paths in sorted(clashes.items())
+                )
+                raise LoadBlocked(
+                    f"refused {local.name}: per-file signatures authenticate the "
+                    f"basename only, and these share one — {detail}. Sign the "
+                    "directory instead, which covers every relative path."
+                )
+
             for f in files:
                 self._check(f, default_sig_path(f))
             return str(local)
