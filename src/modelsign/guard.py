@@ -84,6 +84,7 @@ class _HubGuard:
     def __init__(self, **policy: Any):
         self.policy = policy
         self._patches: list[tuple[Any, str, Callable]] = []
+        self._class_patches: list[tuple[Any, str, Any]] = []
 
     # -- policy ---------------------------------------------------------
     @property
@@ -237,6 +238,69 @@ class _HubGuard:
         except Exception:
             return None
 
+    def _wrap_from_pretrained(self, original: Callable) -> Callable:
+        """Verify a local path handed straight to from_pretrained.
+
+        A repo id goes through the Hub hooks. A path that already exists
+        locally does not download anything, so without this it would load
+        unverified.
+        """
+        def guarded(cls, pretrained_model_name_or_path=None, *args: Any, **kwargs: Any):
+            target = pretrained_model_name_or_path
+            if target is not None and not isinstance(target, Path) and not isinstance(target, str):
+                candidate = None
+            else:
+                candidate = Path(target).expanduser() if target is not None else None
+
+            if candidate is not None and candidate.exists():
+                if candidate.is_dir():
+                    for sig in (default_sig_path(candidate), candidate / DIR_SIG_NAME):
+                        if sig.exists():
+                            self._check(candidate, sig)
+                            break
+                    else:
+                        bundle = candidate / DEFAULT_BUNDLE_NAME
+                        if bundle.exists() and self.policy.get("oms_pubkey"):
+                            self._check_oms(candidate, bundle)
+                        else:
+                            self._unsigned(candidate)
+                else:
+                    sig = default_sig_path(candidate)
+                    if sig.exists():
+                        self._check(candidate, sig)
+                    else:
+                        self._unsigned(candidate)
+
+            return original(cls, pretrained_model_name_or_path, *args, **kwargs)
+
+        return guarded
+
+    def _install_local_loaders(self) -> None:
+        """Guard from_pretrained for paths that never touch the Hub."""
+        transformers = sys.modules.get("transformers")
+        if transformers is None:
+            try:
+                import transformers  # noqa: F811
+            except Exception:
+                return
+
+        base = getattr(transformers, "PreTrainedModel", None)
+        if base is None:
+            return
+        original = base.__dict__.get("from_pretrained")
+        if original is None or getattr(original, "_modelsign_guarded", False):
+            return
+
+        underlying = original.__func__ if isinstance(original, classmethod) else original
+        guarded = self._wrap_from_pretrained(underlying)
+        guarded._modelsign_guarded = True  # type: ignore[attr-defined]
+        guarded.__name__ = getattr(underlying, "__name__", "from_pretrained")
+        try:
+            base.from_pretrained = classmethod(guarded)
+        except Exception:
+            return
+        self._class_patches.append((base, "from_pretrained", original))
+
     # -- install/remove -------------------------------------------------
     def install(self) -> None:
         """Replace every reachable reference to the download functions.
@@ -247,7 +311,12 @@ class _HubGuard:
         pointing at the unguarded original, so this rebinds every module in
         sys.modules that holds one — whatever order the imports happened in.
         """
-        import huggingface_hub
+        try:
+            import huggingface_hub
+        except ImportError:
+            # Nothing to hook on the download path; local loaders still apply,
+            # so guarding a workflow that only reads local paths is fine.
+            huggingface_hub = None
 
         wrappers = {
             "hf_hub_download": self._wrap_file,
@@ -255,7 +324,7 @@ class _HubGuard:
         }
 
         replacements: list[tuple[Callable, Callable]] = []
-        for name, wrapper in wrappers.items():
+        for name, wrapper in (wrappers.items() if huggingface_hub is not None else ()):
             original = getattr(huggingface_hub, name, None)
             if original is None or getattr(original, "_modelsign_guarded", False):
                 continue
@@ -266,6 +335,8 @@ class _HubGuard:
             replacements.append((original, guarded))
 
         if not replacements:
+            if self.policy.get("cover_local", True):
+                self._install_local_loaders()
             return
 
         # Compared with `is` rather than looked up in a dict: an arbitrary
@@ -285,7 +356,16 @@ class _HubGuard:
                     self._patches.append((module, attr, value))
                     break
 
+        if self.policy.get("cover_local", True):
+            self._install_local_loaders()
+
     def remove(self) -> None:
+        for owner, attr, original in reversed(self._class_patches):
+            try:
+                setattr(owner, attr, original)
+            except Exception:
+                continue
+        self._class_patches.clear()
         for module, attr, original in reversed(self._patches):
             try:
                 setattr(module, attr, original)
@@ -306,6 +386,7 @@ def install(
     allow_unsigned: bool = False,
     allow_unbound_names: bool = False,
     allow_per_file: bool = False,
+    cover_local: bool = True,
 ) -> None:
     """Make unverified Hub downloads raise :class:`LoadBlocked`.
 
@@ -313,6 +394,14 @@ def install(
     can set the trusted key without touching code.
     """
     global _active
+
+    # Environment defaults are resolved before the policy is built, so the
+    # comparison below and the guard itself see exactly the same thing.
+    if pubkey is None:
+        pubkey = os.environ.get("MODELSIGN_PUBKEY") or None
+    if oms_pubkey is None:
+        oms_pubkey = os.environ.get("MODELSIGN_OMS_PUBKEY") or None
+
     policy = {
         "pubkey": pubkey,
         "oms_pubkey": oms_pubkey,
@@ -321,9 +410,11 @@ def install(
         "allow_unsigned": allow_unsigned,
         "allow_unbound_names": allow_unbound_names,
         "allow_per_file": allow_per_file,
+        "cover_local": cover_local,
     }
+
     if _active is not None:
-        if {k: _active.policy.get(k) for k in policy} == policy:
+        if _active.policy == policy:
             return
         raise RuntimeError(
             "modelsign.guard is already installed with a different policy. "
@@ -331,20 +422,8 @@ def install(
             "would leave a caller believing its own, stricter one was in force."
         )
 
-    if pubkey is None:
-        pubkey = os.environ.get("MODELSIGN_PUBKEY") or None
-    if oms_pubkey is None:
-        oms_pubkey = os.environ.get("MODELSIGN_OMS_PUBKEY") or None
-
-    guard = _HubGuard(
-        pubkey=pubkey,
-        oms_pubkey=oms_pubkey,
-        keyring_dir=keyring_dir,
-        allow_embedded=allow_embedded,
-        allow_unsigned=allow_unsigned,
-        allow_unbound_names=allow_unbound_names,
-        allow_per_file=allow_per_file,
-    )
+    # Built from the same dict that was compared, so the two cannot diverge.
+    guard = _HubGuard(**policy)
     guard.install()
     _active = guard
 

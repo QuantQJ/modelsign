@@ -569,3 +569,92 @@ def test_installing_the_same_policy_twice_is_fine(fake_hub, tmp_keypair):
     guard.install(pubkey=tmp_keypair["public"], allow_per_file=True)
     guard.install(pubkey=tmp_keypair["public"], allow_per_file=True)
     assert guard.is_installed()
+
+
+# -- local paths never reach the Hub hooks, so from_pretrained is guarded too
+
+
+@pytest.fixture
+def fake_transformers(monkeypatch):
+    """A stand-in transformers whose PreTrainedModel records its calls."""
+    import sys
+    import types
+
+    module = types.ModuleType("transformers")
+    calls = []
+
+    class PreTrainedModel:
+        @classmethod
+        def from_pretrained(cls, pretrained_model_name_or_path=None, *args, **kwargs):
+            calls.append(pretrained_model_name_or_path)
+            return f"loaded:{pretrained_model_name_or_path}"
+
+    module.PreTrainedModel = PreTrainedModel
+    monkeypatch.setitem(sys.modules, "transformers", module)
+    yield types.SimpleNamespace(module=module, model=PreTrainedModel, calls=calls)
+    guard.uninstall()
+
+
+def test_unsigned_local_directory_is_refused(fake_transformers, tmp_keypair, tmp_path):
+    model = tmp_path / "local-model"
+    model.mkdir()
+    (model / "model.safetensors").write_bytes(b"weights")
+
+    guard.install(pubkey=tmp_keypair["public"])
+    with pytest.raises(guard.LoadBlocked):
+        fake_transformers.model.from_pretrained(str(model))
+    assert fake_transformers.calls == []
+
+
+def test_signed_local_directory_loads(fake_transformers, tmp_keypair, tmp_path):
+    from modelsign.api import sign_model
+
+    model = tmp_path / "local-model"
+    model.mkdir()
+    (model / "model.safetensors").write_bytes(b"weights")
+    sign_model(
+        model,
+        name="Local",
+        key=tmp_keypair["private"],
+        sig_path=model / guard.DIR_SIG_NAME,
+    )
+
+    guard.install(pubkey=tmp_keypair["public"])
+    assert fake_transformers.model.from_pretrained(str(model)) == f"loaded:{model}"
+
+
+def test_tampered_local_file_is_refused(fake_transformers, tmp_keypair, tmp_path):
+    from modelsign.api import sign_model
+
+    model = tmp_path / "model.safetensors"
+    model.write_bytes(b"weights")
+    sign_model(model, name="Local", key=tmp_keypair["private"])
+    model.write_bytes(b"swapped")
+
+    guard.install(pubkey=tmp_keypair["public"])
+    with pytest.raises(guard.LoadBlocked) as excinfo:
+        fake_transformers.model.from_pretrained(str(model))
+    assert "hash mismatch" in str(excinfo.value)
+
+
+def test_a_repo_id_is_left_to_the_hub_hooks(fake_transformers, tmp_keypair):
+    """Not a local path, so from_pretrained passes it through to be downloaded."""
+    guard.install(pubkey=tmp_keypair["public"])
+    assert fake_transformers.model.from_pretrained("acme/llama-8b") == "loaded:acme/llama-8b"
+
+
+def test_uninstall_restores_from_pretrained(fake_transformers, tmp_keypair):
+    original = fake_transformers.model.__dict__["from_pretrained"]
+    guard.install(pubkey=tmp_keypair["public"])
+    assert fake_transformers.model.__dict__["from_pretrained"] is not original
+    guard.uninstall()
+    assert fake_transformers.model.__dict__["from_pretrained"] is original
+
+
+def test_cover_local_can_be_turned_off(fake_transformers, tmp_keypair, tmp_path):
+    model = tmp_path / "local-model"
+    model.mkdir()
+    (model / "model.safetensors").write_bytes(b"weights")
+
+    guard.install(pubkey=tmp_keypair["public"], cover_local=False)
+    assert fake_transformers.model.from_pretrained(str(model)) == f"loaded:{model}"
