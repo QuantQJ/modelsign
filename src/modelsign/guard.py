@@ -40,12 +40,18 @@ def require_verified(
     pubkey: Path | str | None = None,
     keyring_dir: Path | str | None = None,
     allow_embedded: bool = False,
+    allow_unbound_names: bool = False,
 ) -> VerifyResult:
     """Verify a model or raise :class:`LoadBlocked`.
 
     ``allow_embedded`` accepts a signature that can only be checked against
     its own embedded key. That proves the bytes are unchanged since signing
     and nothing about who signed them, so it stays off by default.
+
+    ``allow_unbound_names`` accepts a modelsign 1.x signature of a single
+    file, where the filename is not covered by the signature and two signed
+    files can be presented under each other's names. Also off by default,
+    because this runs at the point an attacker's file would be loaded.
     """
     try:
         result = verify_model(
@@ -54,6 +60,7 @@ def require_verified(
             pubkey=pubkey,
             keyring_dir=keyring_dir,
             require_trusted=not allow_embedded,
+            require_name_binding=not allow_unbound_names,
         )
     except VerifyError as e:
         raise LoadBlocked(f"refused {Path(model_path).name}: {e}") from e
@@ -85,6 +92,7 @@ class _HubGuard:
             pubkey=self.policy.get("pubkey"),
             keyring_dir=self.policy.get("keyring_dir"),
             allow_embedded=bool(self.policy.get("allow_embedded", False)),
+            allow_unbound_names=bool(self.policy.get("allow_unbound_names", False)),
         )
 
     def _check_oms(self, path: Path, bundle: Path) -> None:
@@ -248,6 +256,7 @@ def install(
     keyring_dir: Path | str | None = None,
     allow_embedded: bool = False,
     allow_unsigned: bool = False,
+    allow_unbound_names: bool = False,
 ) -> None:
     """Make unverified Hub downloads raise :class:`LoadBlocked`.
 
@@ -269,6 +278,7 @@ def install(
         keyring_dir=keyring_dir,
         allow_embedded=allow_embedded,
         allow_unsigned=allow_unsigned,
+        allow_unbound_names=allow_unbound_names,
     )
     guard.install()
     _active = guard

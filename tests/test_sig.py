@@ -41,7 +41,7 @@ def test_sig_file_is_valid_json(tmp_path):
 def test_read_sig_minor_version_warns(tmp_path, capsys):
     sig_path = tmp_path / "test.sig"
     data = {
-        "modelsign_version": "1.1",
+        "modelsign_version": "2.1",
         "file": "m.bin", "sha256": "a" * 64,
         "signature": "sig", "algorithm": "ed25519",
         "signed_at": "2026-01-01T00:00:00Z",
@@ -50,7 +50,7 @@ def test_read_sig_minor_version_warns(tmp_path, capsys):
     }
     sig_path.write_text(json.dumps(data))
     sig = read_sig(sig_path)
-    assert sig.modelsign_version == "1.1"
+    assert sig.modelsign_version == "2.1"
     captured = capsys.readouterr()
     assert "newer" in captured.err.lower() or "unrecognized" in captured.err.lower()
 
@@ -58,7 +58,7 @@ def test_read_sig_minor_version_warns(tmp_path, capsys):
 def test_read_sig_major_version_errors(tmp_path):
     sig_path = tmp_path / "test.sig"
     data = {
-        "modelsign_version": "2.0",
+        "modelsign_version": "3.0",
         "file": "m.bin", "sha256": "a" * 64,
         "signature": "sig", "algorithm": "ed25519",
         "signed_at": "2026-01-01T00:00:00Z",

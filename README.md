@@ -62,6 +62,20 @@ In CI, demand a known signer — an embedded key proves the bytes are unchanged 
 modelsign verify ./model --require-trusted --pubkey vendor.pem
 ```
 
+### Signature format
+
+New signatures are **modelsign 2.0**, which puts the file's name inside the
+signed message. In 1.x the name lived in an unauthenticated `file` field, so
+two separately-signed files could be presented under each other's names by
+editing that field. A directory signature does not need this — its manifest
+hash already covers every relative path, which is also why a snapshot
+verifies under whatever directory name it lands in.
+
+1.x signatures still verify, and `VerifyResult.name_bound` tells you which
+kind you have. `verify_model(..., require_name_binding=True)` rejects 1.x,
+and `guard.install()` does so by default for single files — pass
+`allow_unbound_names=True` only if you have old signatures you cannot re-sign.
+
 ## Python API
 
 ```python

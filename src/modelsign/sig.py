@@ -7,8 +7,8 @@ from pathlib import Path
 from typing import Optional
 
 
-CURRENT_VERSION = "1.0"
-SUPPORTED_MAJOR = 1
+CURRENT_VERSION = "2.0"
+SUPPORTED_MAJOR = 2
 
 
 class SigVersionError(Exception):

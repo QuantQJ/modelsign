@@ -26,3 +26,34 @@ def build_dir_message(manifest_hash: str, identity_bytes: bytes) -> bytes:
     Format: b"modelsign-v1:dir:" + manifest_hash + b":" + identity_bytes
     """
     return b"modelsign-v1:dir:" + manifest_hash.encode("utf-8") + b":" + identity_bytes
+
+
+def _length_prefixed(name: str) -> bytes:
+    """Encode a name so it cannot be confused with what follows it.
+
+    The length prefix is what keeps a name containing ":" from shifting the
+    field boundaries — the same reason DSSE's pre-authentication encoding
+    prefixes lengths rather than relying on separators alone.
+    """
+    raw = name.encode("utf-8")
+    return str(len(raw)).encode("ascii") + b":" + raw
+
+
+def build_file_message_v2(name: str, file_hash: str, identity_bytes: bytes) -> bytes:
+    """Message to sign for a single file, with its name authenticated.
+
+    Format: b"modelsign-v2:file:" + len(name) + b":" + name + b":"
+            + file_hash + b":" + identity_bytes
+
+    v1 left the name out, so a .sig's `file` field was unauthenticated and
+    two signed files could be presented under each other's names.
+    """
+    return (
+        b"modelsign-v2:file:"
+        + _length_prefixed(name)
+        + b":"
+        + file_hash.encode("utf-8")
+        + b":"
+        + identity_bytes
+    )
+

@@ -383,3 +383,21 @@ def test_uninstall_restores_every_patched_reference(fake_hub, tmp_keypair):
         assert fake_hub.module.hf_hub_download is original
     finally:
         sys.modules.pop("pretend_consumer", None)
+
+
+def test_guard_rejects_an_unbound_name_by_default(fake_hub, tmp_keypair, tmp_path):
+    """At the load chokepoint a 1.x single-file signature is not good enough."""
+    from tests.test_api import _write_v1_sig
+
+    model = tmp_path / "legacy.safetensors"
+    model.write_bytes(b"weights")
+    _write_v1_sig(model, tmp_keypair)
+
+    with pytest.raises(guard.LoadBlocked) as excinfo:
+        guard.require_verified(model, pubkey=tmp_keypair["public"])
+    assert "unauthenticated name" in str(excinfo.value)
+
+    # and the escape hatch is explicit
+    assert guard.require_verified(
+        model, pubkey=tmp_keypair["public"], allow_unbound_names=True
+    ).verified
