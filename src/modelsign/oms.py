@@ -364,6 +364,16 @@ def verify_bundle(
     ignore_paths = serialization_info.get("ignore_paths", list(DEFAULT_IGNORE_PATHS))
     signed = {r["name"]: r["digest"] for r in predicate.get("resources", [])}
 
+    if not signed:
+        raise OMSError("bundle signs no resources")
+
+    if not model_path.is_dir():
+        if len(signed) != 1 or model_path.name not in signed:
+            raise OMSError(
+                f"bundle covers {sorted(signed)} and cannot verify the single "
+                f"file {model_path.name!r}; point it at the signed directory"
+            )
+
     result_fields = dict(
         model=str(model_path),
         fingerprint=key_hint(public_key)[:16],

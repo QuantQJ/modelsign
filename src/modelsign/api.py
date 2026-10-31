@@ -205,7 +205,7 @@ def verify_model(
     pubkey: Path | str | None = None,
     keyring_dir: Path | str | None = None,
     require_trusted: bool = False,
-    require_name_binding: bool = False,
+    require_name_binding: bool = True,
 ) -> VerifyResult:
     """Verify a model against its signature.
 
@@ -217,8 +217,10 @@ def verify_model(
     own embedded key is reported as unverified — use it wherever the identity
     of the signer matters, not just the integrity of the bytes.
 
-    With ``require_name_binding``, a modelsign 1.x signature is rejected
-    because that format does not cover the model's name.
+    ``require_name_binding`` is on by default: a modelsign 1.x signature of a
+    single file is rejected, because that format leaves the filename out of
+    the signed message. Pass False only for old signatures you cannot
+    re-sign.
     """
     model_path = Path(model_path)
     sig_file = Path(sig_path) if sig_path else default_sig_path(model_path)

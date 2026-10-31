@@ -175,7 +175,16 @@ _FAILURE_LINES = {
     default=False,
     help="Fail unless the signing key is in the keyring or given with --pubkey.",
 )
-def verify(model_path, sig_path, pubkey_path, output_json, quiet, require_trusted):
+@click.option(
+    "--allow-unbound-name",
+    is_flag=True,
+    default=False,
+    help="Accept a modelsign 1.x signature, which does not cover the filename.",
+)
+def verify(
+    model_path, sig_path, pubkey_path, output_json, quiet, require_trusted,
+    allow_unbound_name,
+):
     """Verify a signed model file or directory."""
     model_path = Path(model_path)
 
@@ -185,6 +194,7 @@ def verify(model_path, sig_path, pubkey_path, output_json, quiet, require_truste
             sig_path=sig_path,
             pubkey=pubkey_path,
             require_trusted=require_trusted,
+            require_name_binding=not allow_unbound_name,
         )
     except VerifyError as e:
         if not quiet:

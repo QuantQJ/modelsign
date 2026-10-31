@@ -31,7 +31,8 @@ One hook covers `transformers`, `sentence-transformers`, `diffusers` and vLLM, b
 
 - fetches `MODEL.sig` from the same repo as the weights rather than hoping it is already on disk;
 - refuses a download with **no** signature (`allow_unsigned=True` if you must);
-- requires a signature for **every** file in a snapshot, so an unsigned `pytorch_model.bin` cannot ride along beside a signed `model.safetensors`;
+- requires a signature over the **whole snapshot** — a directory signature or an OMS bundle — because per-file signatures cannot say where in a repository a file belongs (`allow_per_file=True` opts into them, and then every file must carry one, so an unsigned `pytorch_model.bin` cannot ride along beside a signed `model.safetensors`);
+- rejects a modelsign 1.x signature of a single file, whose filename is not covered by the signature (`allow_unbound_names=True` opts out);
 - accepts an OMS bundle on equal footing when you pass `oms_pubkey=` (or `MODELSIGN_OMS_PUBKEY`).
 
 To check a path yourself:
@@ -77,10 +78,10 @@ it. So prefer a directory signature for a multi-file model: the guard refuses
 a snapshot whose per-file signatures share a basename across directories,
 because those files would be interchangeable.
 
-1.x signatures still verify, and `VerifyResult.name_bound` tells you which
-kind you have. `verify_model(..., require_name_binding=True)` rejects 1.x,
-and `guard.install()` does so by default for single files — pass
-`allow_unbound_names=True` only if you have old signatures you cannot re-sign.
+`VerifyResult.name_bound` tells you which kind of signature you have.
+Rejecting 1.x is the **default** in `verify_model`, in `modelsign verify` and
+in the guard; `require_name_binding=False` or `--allow-unbound-name` opts out,
+for old signatures you cannot re-sign.
 
 ## Python API
 

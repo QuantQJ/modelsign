@@ -43,3 +43,52 @@ def tmp_model_dir(tmp_path):
     (model_dir / "shard-00002.safetensors").write_bytes(b"shard2-" + os.urandom(32))
     (model_dir / "config.json").write_bytes(b'{"model_type": "llama"}')
     return model_dir
+
+
+@pytest.fixture
+def write_v1_sig():
+    """Build a modelsign 1.x signature, whose `file` field is not signed.
+
+    Lives here rather than in a test module so both test files can use it:
+    importing across test modules depends on the rootdir being on sys.path,
+    which held locally and did not in CI.
+    """
+    def _write(model_path, keypair, claimed_name=None):
+        """Hand-build a modelsign 1.x signature, whose `file` field is unsigned."""
+        import base64
+        import time
+
+        from modelsign.crypto.keys import (
+            compute_fingerprint,
+            load_private_key,
+            public_key_to_bytes,
+        )
+        from modelsign.crypto.sign import build_file_message, sign_bytes
+        from modelsign.formats.single import hash_file
+        from modelsign.identity.canonical import canonical_json
+        from modelsign.identity.card import ModelCard
+        from modelsign.api import default_sig_path
+        from modelsign.sig import SigFile, write_sig
+
+        key = load_private_key(keypair["private"])
+        identity = ModelCard(name="Legacy").to_dict()
+        digest = hash_file(model_path)
+        signature = sign_bytes(
+            build_file_message(digest, canonical_json(identity)), key
+        )
+        sig = SigFile(
+            modelsign_version="1.0",
+            file=claimed_name or model_path.name,
+            sha256=f"sha256:{digest}",
+            signature=base64.b64encode(signature).decode(),
+            algorithm="ed25519",
+            signed_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            public_key=base64.b64encode(public_key_to_bytes(key.public_key())).decode(),
+            key_fingerprint=compute_fingerprint(key.public_key()),
+            identity=identity,
+        )
+        write_sig(sig, default_sig_path(model_path))
+        return sig
+
+
+    return _write

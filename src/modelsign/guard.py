@@ -158,6 +158,17 @@ class _HubGuard:
                 self._check_oms(local, oms_bundle)
                 return str(local)
 
+            # Per-file signatures do not bind a file to its place in the
+            # repository, so a snapshot needs a signature over the whole
+            # directory unless the caller opts in explicitly.
+            if not self.policy.get("allow_per_file", False):
+                raise LoadBlocked(
+                    f"refused {local.name}: no directory signature "
+                    f"({local.name}.sig) or OMS bundle ({DEFAULT_BUNDLE_NAME}). "
+                    "Per-file signatures do not bind a file to its path; sign "
+                    "the directory, or pass allow_per_file=True."
+                )
+
             # Falling back to per-file signatures, every file must carry one.
             # Verifying only the files that happen to be signed would let an
             # unsigned file ride along beside a signed one.
@@ -281,6 +292,7 @@ def install(
     allow_embedded: bool = False,
     allow_unsigned: bool = False,
     allow_unbound_names: bool = False,
+    allow_per_file: bool = False,
 ) -> None:
     """Make unverified Hub downloads raise :class:`LoadBlocked`.
 
@@ -303,6 +315,7 @@ def install(
         allow_embedded=allow_embedded,
         allow_unsigned=allow_unsigned,
         allow_unbound_names=allow_unbound_names,
+        allow_per_file=allow_per_file,
     )
     guard.install()
     _active = guard

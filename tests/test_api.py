@@ -171,39 +171,6 @@ def test_renaming_a_signed_file_fails(tmp_keypair, tmp_model_file, tmp_path):
     assert result.error == "name mismatch"
 
 
-def _write_v1_sig(model_path, keypair, claimed_name=None):
-    """Hand-build a modelsign 1.x signature, whose `file` field is unsigned."""
-    import base64
-    import time
-
-    from modelsign.crypto.keys import compute_fingerprint, public_key_to_bytes
-    from modelsign.crypto.sign import build_file_message, sign_bytes
-    from modelsign.formats.single import hash_file
-    from modelsign.identity.canonical import canonical_json
-    from modelsign.identity.card import ModelCard
-    from modelsign.sig import SigFile, write_sig
-
-    key = load_private_key(keypair["private"])
-    identity = ModelCard(name="Legacy").to_dict()
-    digest = hash_file(model_path)
-    signature = sign_bytes(
-        build_file_message(digest, canonical_json(identity)), key
-    )
-    sig = SigFile(
-        modelsign_version="1.0",
-        file=claimed_name or model_path.name,
-        sha256=f"sha256:{digest}",
-        signature=base64.b64encode(signature).decode(),
-        algorithm="ed25519",
-        signed_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        public_key=base64.b64encode(public_key_to_bytes(key.public_key())).decode(),
-        key_fingerprint=compute_fingerprint(key.public_key()),
-        identity=identity,
-    )
-    write_sig(sig, default_sig_path(model_path))
-    return sig
-
-
 def test_v2_binds_the_name_into_the_signature(tmp_keypair, tmp_path):
     """Editing the .sig's `file` field must not make a swap verify.
 
@@ -253,18 +220,19 @@ def test_new_signatures_are_name_bound(tmp_keypair, tmp_model_file):
     assert result.name_bound is True
 
 
-def test_v1_signatures_still_verify_but_are_not_name_bound(tmp_keypair, tmp_model_file):
-    _write_v1_sig(tmp_model_file, tmp_keypair)
-    result = verify_model(tmp_model_file, pubkey=tmp_keypair["public"])
+def test_v1_signatures_still_verify_but_are_not_name_bound(tmp_keypair, tmp_model_file, write_v1_sig):
+    write_v1_sig(tmp_model_file, tmp_keypair)
+    # 1.x needs the opt-out now that name binding is the default.
+    result = verify_model(
+        tmp_model_file, pubkey=tmp_keypair["public"], require_name_binding=False
+    )
     assert result.verified
     assert result.name_bound is False
 
 
-def test_require_name_binding_rejects_a_v1_signature(tmp_keypair, tmp_model_file):
-    _write_v1_sig(tmp_model_file, tmp_keypair)
-    result = verify_model(
-        tmp_model_file, pubkey=tmp_keypair["public"], require_name_binding=True
-    )
+def test_v1_signatures_are_rejected_by_default(tmp_keypair, tmp_model_file, write_v1_sig):
+    write_v1_sig(tmp_model_file, tmp_keypair)
+    result = verify_model(tmp_model_file, pubkey=tmp_keypair["public"])
     assert not result
     assert result.error == "unauthenticated name"
 

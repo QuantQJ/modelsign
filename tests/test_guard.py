@@ -172,7 +172,7 @@ def test_env_var_supplies_the_trusted_key(fake_hub, tmp_keypair, monkeypatch):
 def test_guarded_snapshot_verifies_each_signed_file(fake_hub, tmp_keypair):
     _publish(fake_hub, tmp_keypair, name="a.safetensors")
     _publish(fake_hub, tmp_keypair, name="b.safetensors")
-    guard.install(pubkey=tmp_keypair["public"])
+    guard.install(pubkey=tmp_keypair["public"], allow_per_file=True)
     local = fake_hub.module.snapshot_download("acme/model")
     assert local.endswith("snapshot")
 
@@ -181,14 +181,14 @@ def test_guarded_snapshot_blocks_one_tampered_shard(fake_hub, tmp_keypair):
     _publish(fake_hub, tmp_keypair, name="a.safetensors")
     bad = _publish(fake_hub, tmp_keypair, name="b.safetensors")
     bad.write_bytes(b"swapped-after-signing")
-    guard.install(pubkey=tmp_keypair["public"])
+    guard.install(pubkey=tmp_keypair["public"], allow_per_file=True)
     with pytest.raises(guard.LoadBlocked):
         fake_hub.module.snapshot_download("acme/model")
 
 
 def test_guarded_snapshot_blocks_wholly_unsigned_repo(fake_hub, tmp_keypair):
     _publish(fake_hub, tmp_keypair, name="a.safetensors", sign=False)
-    guard.install(pubkey=tmp_keypair["public"])
+    guard.install(pubkey=tmp_keypair["public"], allow_per_file=True)
     with pytest.raises(guard.LoadBlocked):
         fake_hub.module.snapshot_download("acme/model")
 
@@ -200,7 +200,7 @@ def test_guarded_snapshot_blocks_unsigned_file_beside_signed_one(fake_hub, tmp_k
     """A signed model next to an unsigned file must not let the pair through."""
     _publish(fake_hub, tmp_keypair, name="model.safetensors")
     _publish(fake_hub, tmp_keypair, name="pytorch_model.bin", sign=False)
-    guard.install(pubkey=tmp_keypair["public"])
+    guard.install(pubkey=tmp_keypair["public"], allow_per_file=True)
     with pytest.raises(guard.LoadBlocked) as excinfo:
         fake_hub.module.snapshot_download("acme/model")
     assert "pytorch_model.bin" in str(excinfo.value)
@@ -210,7 +210,7 @@ def test_guarded_snapshot_names_every_unsigned_file(fake_hub, tmp_keypair):
     _publish(fake_hub, tmp_keypair, name="model.safetensors")
     _publish(fake_hub, tmp_keypair, name="sneaky.pkl", sign=False)
     _publish(fake_hub, tmp_keypair, name="also_sneaky.bin", sign=False)
-    guard.install(pubkey=tmp_keypair["public"])
+    guard.install(pubkey=tmp_keypair["public"], allow_per_file=True)
     with pytest.raises(guard.LoadBlocked) as excinfo:
         fake_hub.module.snapshot_download("acme/model")
     message = str(excinfo.value)
@@ -222,7 +222,7 @@ def test_guarded_snapshot_blocks_unsigned_file_in_subdirectory(fake_hub, tmp_key
     nested = fake_hub.repo / "onnx"
     nested.mkdir()
     (nested / "model.onnx").write_bytes(b"unsigned-nested-weights")
-    guard.install(pubkey=tmp_keypair["public"])
+    guard.install(pubkey=tmp_keypair["public"], allow_per_file=True)
     with pytest.raises(guard.LoadBlocked) as excinfo:
         fake_hub.module.snapshot_download("acme/model")
     assert "onnx/model.onnx" in str(excinfo.value)
@@ -259,7 +259,9 @@ def test_whole_directory_signature_catches_an_added_file(fake_hub, tmp_keypair):
 def test_allow_unsigned_still_bypasses_the_snapshot_check(fake_hub, tmp_keypair):
     _publish(fake_hub, tmp_keypair, name="model.safetensors")
     _publish(fake_hub, tmp_keypair, name="extra.bin", sign=False)
-    guard.install(pubkey=tmp_keypair["public"], allow_unsigned=True)
+    guard.install(
+        pubkey=tmp_keypair["public"], allow_unsigned=True, allow_per_file=True
+    )
     assert fake_hub.module.snapshot_download("acme/model")
 
 
@@ -385,13 +387,13 @@ def test_uninstall_restores_every_patched_reference(fake_hub, tmp_keypair):
         sys.modules.pop("pretend_consumer", None)
 
 
-def test_guard_rejects_an_unbound_name_by_default(fake_hub, tmp_keypair, tmp_path):
+def test_guard_rejects_an_unbound_name_by_default(
+    fake_hub, tmp_keypair, tmp_path, write_v1_sig
+):
     """At the load chokepoint a 1.x single-file signature is not good enough."""
-    from tests.test_api import _write_v1_sig
-
     model = tmp_path / "legacy.safetensors"
     model.write_bytes(b"weights")
-    _write_v1_sig(model, tmp_keypair)
+    write_v1_sig(model, tmp_keypair)
 
     with pytest.raises(guard.LoadBlocked) as excinfo:
         guard.require_verified(model, pubkey=tmp_keypair["public"])
@@ -414,7 +416,7 @@ def test_per_file_mode_refuses_duplicate_basenames(fake_hub, tmp_keypair):
 
     sign_model(target, name="Published-Model", key=tmp_keypair["private"])
 
-    guard.install(pubkey=tmp_keypair["public"])
+    guard.install(pubkey=tmp_keypair["public"], allow_per_file=True)
     with pytest.raises(guard.LoadBlocked) as excinfo:
         fake_hub.module.snapshot_download("acme/model")
     message = str(excinfo.value)
@@ -438,3 +440,18 @@ def test_directory_signature_has_no_basename_ambiguity(fake_hub, tmp_keypair):
     )
     guard.install(pubkey=tmp_keypair["public"])
     assert fake_hub.module.snapshot_download("acme/model")
+
+
+def test_per_file_signatures_are_refused_by_default(fake_hub, tmp_keypair):
+    """A snapshot needs a signature over the whole directory, not per file.
+
+    Per-file signatures bind a basename, never a path, so they cannot say
+    where in a repository a file belongs.
+    """
+    _publish(fake_hub, tmp_keypair, name="model.safetensors")
+    guard.install(pubkey=tmp_keypair["public"])
+    with pytest.raises(guard.LoadBlocked) as excinfo:
+        fake_hub.module.snapshot_download("acme/model")
+    message = str(excinfo.value)
+    assert "no directory signature" in message
+    assert "allow_per_file=True" in message
