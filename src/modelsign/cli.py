@@ -201,6 +201,24 @@ _FAILURE_LINES = {
     help="Accept a signature checkable only against its own key: integrity, not identity.",
 )
 @click.option(
+    "--require-approval",
+    "required_roles",
+    multiple=True,
+    help="Fail unless a trusted key has approved the model in this role. Repeatable.",
+)
+@click.option(
+    "--approver-key",
+    "approver_keys",
+    multiple=True,
+    help="Public key PEM of an approver to trust, beyond the keyring. Repeatable.",
+)
+@click.option(
+    "--min-approvals",
+    default=0,
+    type=int,
+    help="Fail unless at least this many trusted approvals are present.",
+)
+@click.option(
     "--allow-unbound-name",
     is_flag=True,
     default=False,
@@ -208,7 +226,8 @@ _FAILURE_LINES = {
 )
 def verify(
     model_path, sig_path, pubkey_path, output_json, quiet, require_trusted,
-    allow_embedded_key, allow_unbound_name,
+    allow_embedded_key, required_roles, approver_keys, min_approvals,
+    allow_unbound_name,
 ):
     """Verify a signed model file or directory."""
     model_path = Path(model_path)
@@ -242,6 +261,25 @@ def verify(
             click.echo(f"FAILED {model_path.name}\n  {line}", err=result.error == "corrupted sig")
         sys.exit(1)
 
+    approvals = []
+    if required_roles or min_approvals:
+        from modelsign.approvals import ApprovalError, require_approval
+
+        try:
+            approvals = require_approval(
+                sig_path or default_sig_path(model_path),
+                roles=required_roles,
+                count=max(min_approvals, 1 if required_roles else 0),
+                pubkeys=list(approver_keys),
+                keyring_dir=DEFAULT_KEY_DIR / "keyring",
+            )
+        except ApprovalError as e:
+            if output_json:
+                click.echo(json.dumps({"verified": False, "error": "approval", "detail": str(e)}))
+            elif not quiet:
+                click.echo(f"FAILED {model_path.name}\n  approval: {e}")
+            sys.exit(1)
+
     trust_label = _TRUST_LABELS.get(result.trust) or f"TRUSTED (keyring: {result.trusted_alias})"
 
     if output_json:
@@ -253,6 +291,10 @@ def verify(
             "trust": trust_label,
             "signed_at": result.signed_at,
             "identity": result.identity,
+            "approvals": [
+                {"role": a.role, "approver": a.approver, "key": a.key_fingerprint}
+                for a in approvals
+            ],
         }))
         return
 
@@ -272,6 +314,9 @@ def verify(
             click.echo(f"  {label + ':':<13} {identity[field_name]}")
     click.echo(f"  Signed:       {result.signed_at} (unverified — no RFC 3161 timestamp)")
     click.echo(f"  Key:          {result.fingerprint} ({trust_label})")
+    for approval in approvals:
+        who = approval.approver or approval.trusted_alias or approval.key_fingerprint
+        click.echo(f"  Approved:     {approval.role} — {who} ({approval.approved_at})")
     if not result.trusted:
         click.echo("  WARNING: key not in keyring. Run 'modelsign keyring add <pubkey> <alias>' to trust it.")
 
@@ -524,3 +569,39 @@ def lineage(model_path, sig_path, search, pubkey_path, require_complete, output_
         click.echo(f"  {result.error}")
 
     sys.exit(0 if result.verified else 1)
+
+
+@main.command()
+@click.argument("model_path")
+@click.option("--key", "key_path", default=None, help="Private key PEM of the approver.")
+@click.option("--role", required=True, help="What is being approved, e.g. 'release-manager'.")
+@click.option("--approver", default="", help="Who is approving, for the record.")
+@click.option("--sig", "sig_path", default=None, help="Path to .sig file (default: MODEL.sig).")
+def approve(model_path, key_path, role, approver, sig_path):
+    """Countersign a model's signature as an approver.
+
+    An approval is appended to the .sig and signed over that signature's
+    digest, so it cannot be moved to another model. Note that the model's own
+    signature does not cover approvals: removing one leaves no trace, so a
+    verifier has to require the approvals it wants with --require-approval.
+    """
+    from modelsign.approvals import ApprovalError, approve as add_approval
+
+    try:
+        approval = add_approval(
+            model_path,
+            key=key_path or (DEFAULT_KEY_DIR / "private.pem"),
+            role=role,
+            approver=approver,
+            sig_path=sig_path,
+        )
+    except (ApprovalError, VerifyError, ValueError) as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+    click.echo(f"Approved:    {model_path}")
+    click.echo(f"Role:        {approval.role}")
+    if approval.approver:
+        click.echo(f"Approver:    {approval.approver}")
+    click.echo(f"Key:         {approval.key_fingerprint}")
+    click.echo(f"At:          {approval.approved_at}")

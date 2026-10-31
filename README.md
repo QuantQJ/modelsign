@@ -33,6 +33,7 @@ One hook covers `transformers`, `sentence-transformers`, `diffusers` and vLLM, b
 - refuses a download with **no** signature (`allow_unsigned=True` if you must);
 - requires a signature over the **whole snapshot** — a directory signature at `modelsign.sig` inside the repo (or `<dir>.sig` beside it), or an OMS bundle at `model.sig` — because per-file signatures cannot say where in a repository a file belongs (`allow_per_file=True` opts into them, and then every file must carry one, so an unsigned `pytorch_model.bin` cannot ride along beside a signed `model.safetensors`);
 - requires a key you already trust, not merely the one embedded in the signature (`allow_embedded=True` opts out);
+- also guards `PreTrainedModel.from_pretrained` for a **local path**, which downloads nothing and so never reaches the Hub hooks (`cover_local=False` opts out);
 - rejects a modelsign 1.x signature of a single file, whose filename is not covered by the signature (`allow_unbound_names=True` opts out);
 - accepts an OMS bundle on equal footing when you pass `oms_pubkey=` (or `MODELSIGN_OMS_PUBKEY`).
 
@@ -136,6 +137,35 @@ cannot break a chain pointing at it.
 
 Without `--require-complete`, a chain that runs out of findable ancestors is
 reported as verified but incomplete rather than failed.
+
+## Approvals
+
+A signature says who built a model. Deployment usually needs a second claim —
+that someone signed off on releasing it:
+
+```bash
+modelsign approve ./model --key rm.pem --role release-manager --approver "J. Kerr"
+modelsign verify ./model --pubkey vendor.pem \
+    --require-approval release-manager --approver-key rm_pub.pem
+```
+
+```
+VERIFIED model.safetensors
+  Name:         Llama-8B-rc1
+  Key:          ed25519:743322af (TRUSTED (--pubkey))
+  Approved:     release-manager — J. Kerr (2026-10-31T14:51:25Z)
+```
+
+An approval is a separate signature over the digest of the model's signature,
+so it cannot be moved to another model or survive a re-signing. Only an
+approval made by a key the verifier already holds can satisfy a policy — one
+signed by a key that arrived with the model proves nothing, and
+`read_approvals` reports it as valid but untrusted.
+
+**The limitation, stated plainly:** approvals are appended after the model was
+signed, so the model's own signature does not cover them. Editing one breaks
+it, but **removing** one leaves no trace. That is why a verifier must *require*
+the approvals it wants rather than trust whatever a `.sig` happens to carry.
 
 ## OpenSSF Model Signing interoperability
 
