@@ -3,6 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
+    # Without this a tag push does not match `branches`, so the workflow never
+    # ran for a tag and the publish job below was unreachable.
+    tags: ['v*']
   pull_request:
     branches: [main]
 
