@@ -27,6 +27,46 @@ jobs:
       - name: Run tests
         run: pytest tests/ -v --tb=short
 
+  action:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install this checkout
+        run: pip install -e .
+
+      - name: Build signed fixtures
+        run: |
+          # Separate models per format: a modelsign directory signature covers
+          # every file in the directory, including a bundle written into it.
+          for d in fixture-modelsign fixture-oms; do
+            mkdir -p "$d"
+            echo "weights" > "$d/model.safetensors"
+            echo '{"model_type":"llama"}' > "$d/config.json"
+          done
+          modelsign keygen --out keys/private.pem
+          modelsign sign fixture-modelsign --name "CI-Fixture" --key keys/private.pem
+          modelsign oms keygen --dir keys
+          modelsign oms export fixture-oms --key keys/oms_private.pem \
+            --out fixture-oms/model.sig
+
+      - name: Action verifies a modelsign signature
+        uses: ./
+        with:
+          model: fixture-modelsign
+          pubkey: keys/public.pem
+
+      - name: Action verifies an OMS bundle
+        uses: ./
+        with:
+          model: fixture-oms
+          oms-pubkey: keys/oms_public.pem
+
   publish:
     needs: test
     runs-on: ubuntu-latest

@@ -1,0 +1,76 @@
+name: 'Verify signed models'
+description: 'Fail the build unless model files verify against a key you trust.'
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  model:
+    description: 'Path to the model file or directory to verify.'
+    required: true
+  pubkey:
+    description: 'Trusted Ed25519 public key PEM, for a modelsign .sig.'
+    required: false
+    default: ''
+  oms-pubkey:
+    description: 'Trusted ECDSA public key PEM, for an OpenSSF Model Signing bundle.'
+    required: false
+    default: ''
+  bundle:
+    description: 'Path to the OMS bundle (default: model.sig beside the model).'
+    required: false
+    default: ''
+  require-trusted:
+    description: 'Fail when only the signature''s own embedded key is available.'
+    required: false
+    default: 'true'
+  version:
+    description: 'modelsign version to install (default: latest).'
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Install modelsign
+      shell: bash
+      run: |
+        if command -v modelsign >/dev/null 2>&1 && [ -z "${{ inputs.version }}" ]; then
+          echo "using the modelsign already on PATH: $(modelsign version)"
+        elif [ -n "${{ inputs.version }}" ]; then
+          pip install --disable-pip-version-check "modelsign==${{ inputs.version }}"
+        else
+          pip install --disable-pip-version-check modelsign
+        fi
+
+    - name: Verify
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        if [ -z "${{ inputs.pubkey }}" ] && [ -z "${{ inputs.oms-pubkey }}" ]; then
+          echo "::error::provide pubkey (modelsign .sig) or oms-pubkey (OMS bundle)"
+          exit 1
+        fi
+
+        if [ -n "${{ inputs.oms-pubkey }}" ]; then
+          args=(oms verify "${{ inputs.model }}" --pubkey "${{ inputs.oms-pubkey }}")
+          if [ -n "${{ inputs.bundle }}" ]; then
+            args+=(--bundle "${{ inputs.bundle }}")
+          fi
+        else
+          args=(verify "${{ inputs.model }}" --pubkey "${{ inputs.pubkey }}")
+          if [ "${{ inputs.require-trusted }}" = "true" ]; then
+            args+=(--require-trusted)
+          fi
+        fi
+
+        echo "::group::modelsign ${args[*]}"
+        if modelsign "${args[@]}"; then
+          echo "::endgroup::"
+        else
+          status=$?
+          echo "::endgroup::"
+          echo "::error title=Unverified model::${{ inputs.model }} did not verify"
+          exit $status
+        fi
