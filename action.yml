@@ -34,33 +34,46 @@ runs:
   steps:
     - name: Install modelsign
       shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
       run: |
-        if command -v modelsign >/dev/null 2>&1 && [ -z "${{ inputs.version }}" ]; then
+        set -euo pipefail
+        if [ -n "$VERSION" ] && ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+(\.[0-9]+)*((a|b|rc)[0-9]+)?$'; then
+          echo "::error::version must be a plain release number, got '$VERSION'"
+          exit 1
+        fi
+        if command -v modelsign >/dev/null 2>&1 && [ -z "$VERSION" ]; then
           echo "using the modelsign already on PATH: $(modelsign version)"
-        elif [ -n "${{ inputs.version }}" ]; then
-          pip install --disable-pip-version-check "modelsign==${{ inputs.version }}"
+        elif [ -n "$VERSION" ]; then
+          pip install --disable-pip-version-check "modelsign==$VERSION"
         else
           pip install --disable-pip-version-check modelsign
         fi
 
     - name: Verify
       shell: bash
+      env:
+        MODEL: ${{ inputs.model }}
+        PUBKEY: ${{ inputs.pubkey }}
+        OMS_PUBKEY: ${{ inputs.oms-pubkey }}
+        BUNDLE: ${{ inputs.bundle }}
+        REQUIRE_TRUSTED: ${{ inputs.require-trusted }}
       run: |
         set -euo pipefail
 
-        if [ -z "${{ inputs.pubkey }}" ] && [ -z "${{ inputs.oms-pubkey }}" ]; then
+        if [ -z "$PUBKEY" ] && [ -z "$OMS_PUBKEY" ]; then
           echo "::error::provide pubkey (modelsign .sig) or oms-pubkey (OMS bundle)"
           exit 1
         fi
 
-        if [ -n "${{ inputs.oms-pubkey }}" ]; then
-          args=(oms verify "${{ inputs.model }}" --pubkey "${{ inputs.oms-pubkey }}")
-          if [ -n "${{ inputs.bundle }}" ]; then
-            args+=(--bundle "${{ inputs.bundle }}")
+        if [ -n "$OMS_PUBKEY" ]; then
+          args=(oms verify "$MODEL" --pubkey "$OMS_PUBKEY")
+          if [ -n "$BUNDLE" ]; then
+            args+=(--bundle "$BUNDLE")
           fi
         else
-          args=(verify "${{ inputs.model }}" --pubkey "${{ inputs.pubkey }}")
-          if [ "${{ inputs.require-trusted }}" = "true" ]; then
+          args=(verify "$MODEL" --pubkey "$PUBKEY")
+          if [ "$REQUIRE_TRUSTED" = "true" ]; then
             args+=(--require-trusted)
           fi
         fi
@@ -71,6 +84,6 @@ runs:
         else
           status=$?
           echo "::endgroup::"
-          echo "::error title=Unverified model::${{ inputs.model }} did not verify"
+          echo "::error title=Unverified model::model did not verify"
           exit $status
         fi

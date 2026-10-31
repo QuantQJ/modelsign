@@ -206,6 +206,22 @@ def verify_model(
     key, trust, alias = _resolve_public_key(sig, pubkey, keyring_dir)
     fingerprint = compute_fingerprint(key)
 
+    # A signature names the file it was made for. Without this check a pair of
+    # signed files could be swapped for each other — shard 1 presented as
+    # shard 2 — since each still matches its own signature.
+    if not model_path.is_dir() and sig.file != model_path.name:
+        return VerifyResult(
+            verified=False,
+            model=str(model_path),
+            error="name mismatch",
+            detail=f"signature was made for {sig.file!r}, not {model_path.name!r}",
+            fingerprint=fingerprint,
+            trust=trust,
+            trusted_alias=alias,
+            signed_at=sig.signed_at,
+            identity=sig.identity,
+        )
+
     _, model_hash = _hash_model(model_path)
 
     # Integrity before authenticity: a modified file is reported as such even

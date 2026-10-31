@@ -15,6 +15,7 @@ unknown key raises :class:`LoadBlocked` instead of returning weights.
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -70,7 +71,7 @@ class _HubGuard:
 
     def __init__(self, **policy: Any):
         self.policy = policy
-        self._originals: dict[str, Callable] = {}
+        self._patches: list[tuple[Any, str, Callable]] = []
 
     # -- policy ---------------------------------------------------------
     @property
@@ -185,13 +186,23 @@ class _HubGuard:
 
     # -- install/remove -------------------------------------------------
     def install(self) -> None:
+        """Replace every reachable reference to the download functions.
+
+        ``from huggingface_hub import hf_hub_download`` binds the function
+        object into the importing module, and transformers does exactly that.
+        Patching only the package attribute would leave those bindings
+        pointing at the unguarded original, so this rebinds every module in
+        sys.modules that holds one — whatever order the imports happened in.
+        """
         import huggingface_hub
 
-        targets = {
+        wrappers = {
             "hf_hub_download": self._wrap_file,
             "snapshot_download": self._wrap_snapshot,
         }
-        for name, wrapper in targets.items():
+
+        guarded_by_original = {}
+        for name, wrapper in wrappers.items():
             original = getattr(huggingface_hub, name, None)
             if original is None or getattr(original, "_modelsign_guarded", False):
                 continue
@@ -199,15 +210,32 @@ class _HubGuard:
             guarded._modelsign_guarded = True  # type: ignore[attr-defined]
             guarded.__name__ = getattr(original, "__name__", name)
             guarded.__doc__ = getattr(original, "__doc__", None)
-            self._originals[name] = original
-            setattr(huggingface_hub, name, guarded)
+            guarded_by_original[original] = (name, guarded)
+
+        if not guarded_by_original:
+            return
+
+        for module in list(sys.modules.values()):
+            if module is None:
+                continue
+            for attr, value in list(vars(module).items()) if hasattr(module, "__dict__") else []:
+                match = guarded_by_original.get(value) if callable(value) else None
+                if match is None:
+                    continue
+                _, guarded = match
+                try:
+                    setattr(module, attr, guarded)
+                except Exception:
+                    continue
+                self._patches.append((module, attr, value))
 
     def remove(self) -> None:
-        import huggingface_hub
-
-        for name, original in self._originals.items():
-            setattr(huggingface_hub, name, original)
-        self._originals.clear()
+        for module, attr, original in reversed(self._patches):
+            try:
+                setattr(module, attr, original)
+            except Exception:
+                continue
+        self._patches.clear()
 
 
 _active: Optional[_HubGuard] = None

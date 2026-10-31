@@ -216,3 +216,50 @@ def test_keygen_writes_a_p256_pair(tmp_path):
     key = oms.load_ec_private_key(priv)
     assert isinstance(key.curve, ec.SECP256R1)
     assert oms.generate_ec_keypair(tmp_path / "keys") == (priv, pub)
+
+
+def test_symlinked_extra_file_is_caught(golden_model, ec_keypair, tmp_path):
+    """A Hugging Face cache is all symlinks, so symlinks must still be counted."""
+    bundle_path = tmp_path / "model.sig"
+    oms.export_bundle(golden_model, key=ec_keypair["private"], out=bundle_path)
+
+    payload = tmp_path / "payload.pkl"
+    payload.write_bytes(b"attacker-controlled")
+    (golden_model / "smuggled.pkl").symlink_to(payload)
+
+    result = oms.verify_bundle(golden_model, bundle_path, pubkey=ec_keypair["public"])
+    assert not result
+    assert result.error == "unsigned files"
+    assert "smuggled.pkl" in result.detail
+
+
+def test_symlinked_signed_files_still_verify(tmp_path, ec_keypair):
+    """The hf cache layout: every entry is a symlink into a blobs dir."""
+    blobs = tmp_path / "blobs"
+    blobs.mkdir()
+    (blobs / "a").write_bytes(GOLDEN_CONFIG)
+    (blobs / "b").write_bytes(GOLDEN_WEIGHTS)
+
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    (snapshot / "config.json").symlink_to(blobs / "a")
+    (snapshot / "model.safetensors").symlink_to(blobs / "b")
+
+    bundle = tmp_path / "model.sig"
+    oms.export_bundle(
+        snapshot, key=ec_keypair["private"], out=bundle, allow_symlinks=True
+    )
+    assert oms.verify_bundle(snapshot, bundle, pubkey=ec_keypair["public"])
+
+
+def test_nested_gitignore_is_not_exempt(golden_model, ec_keypair, tmp_path):
+    """Only the ignore list's own paths are exempt, not same-named files deeper."""
+    bundle_path = tmp_path / "model.sig"
+    oms.export_bundle(golden_model, key=ec_keypair["private"], out=bundle_path)
+    nested = golden_model / "sub"
+    nested.mkdir()
+    (nested / ".gitignore").write_bytes(b"payload")
+
+    result = oms.verify_bundle(golden_model, bundle_path, pubkey=ec_keypair["public"])
+    assert not result
+    assert result.error == "unsigned files"

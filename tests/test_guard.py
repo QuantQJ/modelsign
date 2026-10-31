@@ -336,3 +336,50 @@ def test_oms_env_var_supplies_the_key(fake_hub, ec_pub, monkeypatch):
     monkeypatch.setenv("MODELSIGN_OMS_PUBKEY", str(ec_pub["public"]))
     guard.install()
     assert fake_hub.module.snapshot_download("acme/model")
+
+
+# -- a reference bound before install() must still be guarded
+
+
+def test_install_rebinds_an_already_imported_reference(fake_hub, tmp_keypair):
+    """`from huggingface_hub import hf_hub_download` binds the function object.
+
+    transformers does exactly that, so patching only the package attribute
+    would leave the import-time binding pointing at the unguarded original.
+    """
+    import sys
+    import types
+
+    consumer = types.ModuleType("pretend_transformers")
+    consumer.hf_hub_download = fake_hub.module.hf_hub_download  # bound early
+    sys.modules["pretend_transformers"] = consumer
+    try:
+        _publish(fake_hub, tmp_keypair, name="naked.safetensors", sign=False)
+        guard.install(pubkey=tmp_keypair["public"])
+
+        assert getattr(consumer.hf_hub_download, "_modelsign_guarded", False) is True
+        with pytest.raises(guard.LoadBlocked):
+            consumer.hf_hub_download("acme/model", "naked.safetensors")
+
+        guard.uninstall()
+        # and the early binding is restored, not left pointing at the wrapper
+        assert not getattr(consumer.hf_hub_download, "_modelsign_guarded", False)
+    finally:
+        sys.modules.pop("pretend_transformers", None)
+
+
+def test_uninstall_restores_every_patched_reference(fake_hub, tmp_keypair):
+    import sys
+    import types
+
+    consumer = types.ModuleType("pretend_consumer")
+    original = fake_hub.module.hf_hub_download
+    consumer.hf_hub_download = original
+    sys.modules["pretend_consumer"] = consumer
+    try:
+        guard.install(pubkey=tmp_keypair["public"])
+        guard.uninstall()
+        assert consumer.hf_hub_download is original
+        assert fake_hub.module.hf_hub_download is original
+    finally:
+        sys.modules.pop("pretend_consumer", None)

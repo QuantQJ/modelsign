@@ -145,8 +145,15 @@ class Resource:
 
 
 def _ignored(rel: Path, ignore_paths: Iterable[str]) -> bool:
-    parts = rel.parts
-    return any(p == ignored or parts[0] == ignored for p in parts for ignored in ignore_paths)
+    """True when a relative path is excluded by the manifest's ignore list.
+
+    An entry matches the path itself or a directory it sits under, the way
+    model-signing resolves ignore_paths. It deliberately does not match a
+    same-named file deeper in the tree: an added ``sub/.gitignore`` is an
+    unsigned file, not an ignored one.
+    """
+    candidates = {rel.as_posix(), *(parent.as_posix() for parent in rel.parents)}
+    return any(ignored in candidates for ignored in ignore_paths)
 
 
 def collect_resources(
@@ -355,7 +362,6 @@ def verify_bundle(
     predicate = statement["predicate"]
     serialization_info = predicate.get("serialization") or {}
     ignore_paths = serialization_info.get("ignore_paths", list(DEFAULT_IGNORE_PATHS))
-    allow_symlinks = bool(serialization_info.get("allow_symlinks", False))
     signed = {r["name"]: r["digest"] for r in predicate.get("resources", [])}
 
     result_fields = dict(
@@ -379,13 +385,16 @@ def verify_bundle(
                 detail=f"{name} has been modified since signing", **result_fields
             )
 
-    # And nothing may ride along unsigned.
+    # And nothing may ride along unsigned. Symlinks are counted whether or not
+    # the signer allowed them: a Hugging Face cache is made entirely of
+    # symlinks into blobs/, so skipping them would disable this check exactly
+    # where it matters. Content stays pinned either way, because the digest
+    # check above follows the link.
     if model_path.is_dir() and not allow_unsigned:
         on_disk = {
             p.relative_to(model_path).as_posix()
             for p in model_path.rglob("*")
-            if p.is_file()
-            and (allow_symlinks or not p.is_symlink())
+            if (p.is_file() or p.is_symlink())
             and not _ignored(p.relative_to(model_path), ignore_paths)
         }
         extra = sorted(on_disk - set(signed))

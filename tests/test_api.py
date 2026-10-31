@@ -135,3 +135,37 @@ def test_missing_sig_raises(tmp_model_file):
 def test_sign_without_name_or_card_raises(tmp_keypair, tmp_model_file):
     with pytest.raises(VerifyError):
         sign_model(tmp_model_file, key=tmp_keypair["private"])
+
+
+def test_signature_is_bound_to_its_filename(tmp_keypair, tmp_path):
+    """Two signed shards must not be swappable for each other."""
+    first = tmp_path / "model-00001-of-00002.safetensors"
+    second = tmp_path / "model-00002-of-00002.safetensors"
+    first.write_bytes(b"shard-one")
+    second.write_bytes(b"shard-two")
+    sign_model(first, name="Sharded", key=tmp_keypair["private"])
+    sign_model(second, name="Sharded", key=tmp_keypair["private"])
+
+    # Present shard one, and its signature, under shard two's name.
+    swapped = tmp_path / "swapped" / second.name
+    swapped.parent.mkdir()
+    swapped.write_bytes(first.read_bytes())
+    (tmp_path / "swapped" / (second.name + ".sig")).write_bytes(
+        default_sig_path(first).read_bytes()
+    )
+
+    result = verify_model(swapped, pubkey=tmp_keypair["public"])
+    assert not result
+    assert result.error == "name mismatch"
+
+
+def test_renaming_a_signed_file_fails(tmp_keypair, tmp_model_file, tmp_path):
+    sign_model(tmp_model_file, name="Test-Model", key=tmp_keypair["private"])
+    renamed = tmp_path / "renamed.safetensors"
+    renamed.write_bytes(tmp_model_file.read_bytes())
+    (tmp_path / "renamed.safetensors.sig").write_bytes(
+        default_sig_path(tmp_model_file).read_bytes()
+    )
+    result = verify_model(renamed, pubkey=tmp_keypair["public"])
+    assert not result
+    assert result.error == "name mismatch"
