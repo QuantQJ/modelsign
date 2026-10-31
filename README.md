@@ -157,15 +157,27 @@ VERIFIED model.safetensors
 ```
 
 An approval is a separate signature over the digest of the model's signature,
-so it cannot be moved to another model or survive a re-signing. Only an
-approval made by a key the verifier already holds can satisfy a policy — one
-signed by a key that arrived with the model proves nothing, and
-`read_approvals` reports it as valid but untrusted.
+its own fields, its position in the sequence, and **the digest of the approval
+before it**. That chain is what makes tampering visible:
 
-**The limitation, stated plainly:** approvals are appended after the model was
-signed, so the model's own signature does not cover them. Editing one breaks
-it, but **removing** one leaves no trace. That is why a verifier must *require*
-the approvals it wants rather than trust whatever a `.sig` happens to carry.
+| | detected |
+|---|---|
+| Editing any approval | yes — that approval stops verifying |
+| Removing or reordering one that has another after it | yes — every later approval committed to its exact bytes and to its own index |
+| Removing a **trailing** approval, or all of them | **no** |
+
+The last row is irreducible from inside the file: nothing in a `.sig` counts
+how many approvals belong there, and the model's own signature cannot help
+because approvals are appended after it was made. The answer is policy at
+verification time — `--require-approval`, `--min-approvals` — or an external
+anchor such as a transparency log, not a cleverer signature.
+
+Trust is decided on a **whole public key**, never on the 8-character display
+fingerprint: 32 bits is cheap to collide, and an approval from a ground key
+must not inherit an approver's trust. Every role passed to
+`--require-approval` must be satisfied, not merely one of them, and
+`--min-approvals` counts **distinct** approvers — one person in two roles is
+one person.
 
 ## OpenSSF Model Signing interoperability
 

@@ -181,3 +181,154 @@ def test_a_removed_approval_leaves_no_trace(signed, approver, tmp_keypair):
     assert verify_model(signed, pubkey=tmp_keypair["public"])
     with pytest.raises(ApprovalError):
         require_approval(sig_path, roles=["release-manager"], pubkeys=[approver["public"]])
+
+
+# -- the chain
+
+
+def test_removing_an_interior_approval_is_detected(signed, approver, tmp_path):
+    """Each approval commits to the bytes of the one before it."""
+    second = Ed25519PrivateKey.generate()
+    second_priv = tmp_path / "second.pem"
+    second_priv.write_bytes(second.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ))
+    third = Ed25519PrivateKey.generate()
+    third_priv = tmp_path / "third.pem"
+    third_priv.write_bytes(third.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ))
+
+    approve(signed, key=approver["private"], role="build")
+    approve(signed, key=second_priv, role="security-review")
+    approve(signed, key=third_priv, role="release-manager")
+
+    sig_path = default_sig_path(signed)
+    data = json.loads(sig_path.read_text())
+    del data["approvals"][1]          # drop the middle one
+    sig_path.write_text(json.dumps(data))
+
+    approvals = read_approvals(sig_path)
+    assert approvals[0].chain_ok is True
+    assert approvals[1].chain_ok is False
+    assert approvals[1].error is not None
+
+
+def test_reordering_approvals_is_detected(signed, approver, tmp_path):
+    second = Ed25519PrivateKey.generate()
+    second_priv = tmp_path / "second.pem"
+    second_priv.write_bytes(second.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ))
+    approve(signed, key=approver["private"], role="build")
+    approve(signed, key=second_priv, role="release-manager")
+
+    sig_path = default_sig_path(signed)
+    data = json.loads(sig_path.read_text())
+    data["approvals"].reverse()
+    sig_path.write_text(json.dumps(data))
+
+    approvals = read_approvals(sig_path)
+    assert not all(a.chain_ok for a in approvals)
+
+
+def test_a_trailing_removal_is_still_invisible(signed, approver, tmp_path):
+    """The documented irreducible gap, asserted so it cannot be forgotten."""
+    approve(signed, key=approver["private"], role="build")
+    approve(signed, key=approver["private"], role="release-manager")
+
+    sig_path = default_sig_path(signed)
+    data = json.loads(sig_path.read_text())
+    data["approvals"] = data["approvals"][:1]      # drop the last
+    sig_path.write_text(json.dumps(data))
+
+    approvals = read_approvals(sig_path, pubkeys=[approver["public"]])
+    assert len(approvals) == 1
+    assert approvals[0].ok is True        # nothing inside the file betrays it
+    with pytest.raises(ApprovalError):   # which is why policy has to ask
+        require_approval(
+            sig_path, roles=["release-manager"], pubkeys=[approver["public"]]
+        )
+
+
+def test_an_inserted_approval_breaks_the_chain(signed, approver, tmp_path):
+    approve(signed, key=approver["private"], role="build")
+    sig_path = default_sig_path(signed)
+    data = json.loads(sig_path.read_text())
+    forged = dict(data["approvals"][0])
+    forged["role"] = "release-manager"
+    data["approvals"].append(forged)
+    sig_path.write_text(json.dumps(data))
+
+    approvals = read_approvals(sig_path, pubkeys=[approver["public"]])
+    assert approvals[1].ok is False
+
+
+# -- trust must not rest on a 32-bit fingerprint
+
+
+def test_trust_is_decided_on_the_whole_key_not_the_fingerprint(
+    signed, approver, tmp_path, monkeypatch
+):
+    """Collide the 32-bit display fingerprint and trust must not follow it."""
+    import modelsign.approvals as approvals_mod
+
+    attacker = Ed25519PrivateKey.generate()
+    attacker_priv = tmp_path / "attacker.pem"
+    attacker_priv.write_bytes(attacker.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ))
+
+    # Force every key to share a fingerprint, which is what grinding 32 bits
+    # buys an attacker for a few minutes of compute.
+    monkeypatch.setattr(approvals_mod, "compute_fingerprint", lambda key: "ed25519:collide")
+
+    approve(signed, key=attacker_priv, role="release-manager")
+    result = read_approvals(default_sig_path(signed), pubkeys=[approver["public"]])
+    assert result[0].valid is True       # the attacker signed their own record
+    assert result[0].trusted is False    # but it is not a key we hold
+    with pytest.raises(ApprovalError):
+        require_approval(
+            default_sig_path(signed),
+            roles=["release-manager"],
+            pubkeys=[approver["public"]],
+        )
+
+
+# -- policy
+
+
+def test_every_required_role_must_be_satisfied(signed, approver, tmp_path):
+    approve(signed, key=approver["private"], role="release-manager")
+    with pytest.raises(ApprovalError) as excinfo:
+        require_approval(
+            default_sig_path(signed),
+            roles=["release-manager", "security-review"],
+            pubkeys=[approver["public"]],
+        )
+    assert "security-review" in str(excinfo.value)
+
+
+def test_a_quorum_counts_distinct_approvers(signed, approver):
+    """One person wearing two hats is one approver."""
+    approve(signed, key=approver["private"], role="build")
+    approve(signed, key=approver["private"], role="release-manager")
+
+    assert len(
+        require_approval(
+            default_sig_path(signed), count=1, pubkeys=[approver["public"]]
+        )
+    ) == 2
+    with pytest.raises(ApprovalError) as excinfo:
+        require_approval(
+            default_sig_path(signed), count=2, pubkeys=[approver["public"]]
+        )
+    assert "distinct" in str(excinfo.value)

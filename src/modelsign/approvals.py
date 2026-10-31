@@ -5,18 +5,27 @@ needs a second claim — that a named person or role signed off on releasing it.
 An approval is a separate signature over the digest of the model's signature,
 appended to the same ``.sig``.
 
-Be exact about what this does and does not prove. Each approval is
-self-authenticating: edit its role, its timestamp or the signature it points
-at and it stops verifying. But approvals are added *after* the model was
-signed, so the model's own signature does not cover them — **removing** an
-approval leaves no trace. Presence is therefore something a verifier must
-require by policy (``--require-approval``), never something to infer from a
-signature that happens to carry one.
+Approvals form a chain. Each one signs its own fields, the digest of the
+model's signature, its position in the sequence, and the digest of the
+approval before it. Three consequences, and it is worth being exact about
+which is which:
+
+* **Editing** any approval breaks that approval.
+* **Removing or reordering** an approval that has another after it breaks
+  every later one, because each committed to the exact bytes of its
+  predecessor and to its own index.
+* **Removing a trailing approval** — the last one, or all of them — still
+  leaves no trace, because nothing inside the file counts what should be
+  there. The model's own signature cannot help: approvals are appended after
+  it was made. This is the irreducible part, and the answer to it is policy at
+  verification time (``--require-approval``, ``--min-approvals``) or an
+  external anchor such as a transparency log, not a cleverer signature.
 """
 
 from __future__ import annotations
 
 import base64
+import hashlib
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,9 +45,17 @@ from modelsign.crypto.keys import (
 )
 from modelsign.crypto.sign import _length_prefixed, sign_bytes
 from modelsign.crypto.verify import verify_bytes
+from modelsign.identity.canonical import canonical_json
 from modelsign.sig import SigFile, read_sig, sig_digest, write_sig
 
-__all__ = ["Approval", "ApprovalError", "approve", "read_approvals", "require_approval"]
+__all__ = [
+    "Approval",
+    "ApprovalError",
+    "approval_digest",
+    "approve",
+    "read_approvals",
+    "require_approval",
+]
 
 
 class ApprovalError(Exception):
@@ -46,9 +63,20 @@ class ApprovalError(Exception):
 
 
 def build_approval_message(
-    *, role: str, approver: str, signature_digest: str, approved_at: str
+    *,
+    role: str,
+    approver: str,
+    signature_digest: str,
+    approved_at: str,
+    index: int,
+    prev_digest: str,
 ) -> bytes:
     """The bytes an approval covers.
+
+    ``index`` is its position in the sequence and ``prev_digest`` the digest of
+    the approval before it (empty for the first), which is what makes the
+    chain hold: an approval cannot be removed, reordered or inserted without
+    invalidating the one after it.
 
     Every field is length-prefixed, so a role containing ":" cannot shift the
     boundaries — the same reason the v2 model message prefixes lengths.
@@ -62,7 +90,20 @@ def build_approval_message(
         + _length_prefixed(signature_digest)
         + b":"
         + _length_prefixed(approved_at)
+        + b":"
+        + _length_prefixed(str(index))
+        + b":"
+        + _length_prefixed(prev_digest)
     )
+
+
+def approval_digest(record: dict) -> str:
+    """Digest of one approval record, over its canonical JSON.
+
+    Includes the record's own signature, so the next approval in the chain
+    commits to every byte of this one.
+    """
+    return "sha256:" + hashlib.sha256(canonical_json(record)).hexdigest()
 
 
 @dataclass
@@ -73,14 +114,18 @@ class Approval:
     approver: str
     approved_at: str
     key_fingerprint: str
+    public_key: str = ""
+    index: int = 0
     valid: bool = False
     trusted: bool = False
     trusted_alias: Optional[str] = None
+    chain_ok: bool = False
+    error: Optional[str] = None
 
     @property
     def ok(self) -> bool:
-        """Valid and made by a key we already had."""
-        return self.valid and self.trusted
+        """Valid, in an unbroken chain, and made by a key we already had."""
+        return self.valid and self.chain_ok and self.trusted
 
 
 def approve(
@@ -114,28 +159,40 @@ def approve(
     public_key = private_key.public_key()
     approved_at = when or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
+    existing = list(sig.approvals or [])
+    fingerprint = compute_fingerprint(public_key)
+    if any(
+        a.get("key_fingerprint") == fingerprint and a.get("role") == role
+        for a in existing
+    ):
+        raise ApprovalError(
+            f"{fingerprint} has already approved this signature as {role!r}"
+        )
+
+    # Chain this approval to the one before it, so neither can be removed
+    # without breaking this one.
+    index = len(existing)
+    prev_digest = approval_digest(existing[-1]) if existing else ""
+
     message = build_approval_message(
-        role=role, approver=approver, signature_digest=digest, approved_at=approved_at
+        role=role,
+        approver=approver,
+        signature_digest=digest,
+        approved_at=approved_at,
+        index=index,
+        prev_digest=prev_digest,
     )
     record = {
         "role": role,
         "approver": approver,
         "approved_at": approved_at,
         "signature_digest": digest,
+        "index": index,
+        "prev": prev_digest,
         "public_key": base64.b64encode(public_key_to_bytes(public_key)).decode("ascii"),
-        "key_fingerprint": compute_fingerprint(public_key),
+        "key_fingerprint": fingerprint,
         "signature": base64.b64encode(sign_bytes(message, private_key)).decode("ascii"),
     }
-
-    existing = list(sig.approvals or [])
-    if any(
-        a.get("key_fingerprint") == record["key_fingerprint"]
-        and a.get("role") == role
-        for a in existing
-    ):
-        raise ApprovalError(
-            f"{record['key_fingerprint']} has already approved this signature as {role!r}"
-        )
     existing.append(record)
     sig.approvals = existing
     write_sig(sig, sig_file)
@@ -144,26 +201,38 @@ def approve(
         role=role,
         approver=approver,
         approved_at=approved_at,
-        key_fingerprint=record["key_fingerprint"],
+        key_fingerprint=fingerprint,
+        index=index,
         valid=True,
         trusted=True,
+        chain_ok=True,
     )
 
 
-def _trusted_fingerprints(
+def _trusted_keys(
     pubkeys: Iterable[Path | str], keyring_dir: Path | str | None
-) -> dict[str, str]:
-    """Fingerprint -> alias, for keys the verifier already holds."""
-    trusted: dict[str, str] = {}
+) -> dict[bytes, str]:
+    """Raw public key bytes -> alias, for keys the verifier already holds.
+
+    Keyed on the whole key, not on ``compute_fingerprint``: that is eight hex
+    characters, documented as display-only, and 32 bits is cheap to collide.
+    Trusting on a fingerprint match would let anyone grind a key that collides
+    with an approver's and have their own approval accepted.
+    """
+    trusted: dict[bytes, str] = {}
     for path in pubkeys:
         try:
             key = load_public_key(Path(path).expanduser())
         except Exception:
             continue
-        trusted[compute_fingerprint(key)] = Path(path).stem
+        trusted[public_key_to_bytes(key)] = Path(path).stem
     if keyring_dir is not None:
         for entry in keyring_list(Path(keyring_dir).expanduser()):
-            trusted.setdefault(entry["fingerprint"], entry["alias"])
+            try:
+                key = load_public_key(Path(entry["path"]))
+            except Exception:
+                continue
+            trusted.setdefault(public_key_to_bytes(key), entry["alias"])
     return trusted
 
 
@@ -183,35 +252,59 @@ def read_approvals(
         sig = read_sig(Path(sig))
 
     digest = sig_digest(sig)
-    trusted = _trusted_fingerprints(pubkeys, keyring_dir)
+    trusted = _trusted_keys(pubkeys, keyring_dir)
 
     results = []
-    for record in sig.approvals or []:
+    expected_prev = ""
+    chain_intact = True
+    for position, record in enumerate(sig.approvals or []):
         role = str(record.get("role", ""))
         approver = str(record.get("approver", ""))
         approved_at = str(record.get("approved_at", ""))
         fingerprint = str(record.get("key_fingerprint", ""))
+        index = record.get("index", position)
 
+        error = None
         valid = False
+        raw_key = b""
         # An approval naming a different signature is not valid here, whatever
         # its own cryptography says.
-        if record.get("signature_digest") == digest:
+        if record.get("signature_digest") != digest:
+            error = "signed over a different signature"
+        else:
             try:
-                key = Ed25519PublicKey.from_public_bytes(
-                    base64.b64decode(record["public_key"])
-                )
+                raw_key = base64.b64decode(record["public_key"])
+                key = Ed25519PublicKey.from_public_bytes(raw_key)
                 valid = compute_fingerprint(key) == fingerprint and verify_bytes(
                     build_approval_message(
                         role=role,
                         approver=approver,
                         signature_digest=digest,
                         approved_at=approved_at,
+                        index=int(index),
+                        prev_digest=str(record.get("prev", "")),
                     ),
                     base64.b64decode(record["signature"]),
                     key,
                 )
             except Exception:
                 valid = False
+            if not valid:
+                error = "invalid signature"
+
+        # The chain: this approval must sit where it says it does and name the
+        # exact bytes of the one before it. A break taints this and every
+        # later approval, which is what makes a removal in the middle visible.
+        chain_ok = chain_intact
+        if int(index) != position:
+            chain_ok = False
+            error = error or f"out of sequence (claims {index}, is at {position})"
+        elif str(record.get("prev", "")) != expected_prev:
+            chain_ok = False
+            error = error or "does not follow the approval before it"
+        if not chain_ok:
+            chain_intact = False
+            error = error or "follows a broken link in the chain"
 
         results.append(
             Approval(
@@ -219,11 +312,17 @@ def read_approvals(
                 approver=approver,
                 approved_at=approved_at,
                 key_fingerprint=fingerprint,
+                index=int(index) if str(index).lstrip("-").isdigit() else position,
+                public_key=record.get("public_key", ""),
                 valid=valid,
-                trusted=valid and fingerprint in trusted,
-                trusted_alias=trusted.get(fingerprint) if valid else None,
+                trusted=valid and chain_ok and raw_key in trusted,
+                trusted_alias=trusted.get(raw_key) if valid and chain_ok else None,
+                chain_ok=chain_ok,
+                error=error,
             )
         )
+        expected_prev = approval_digest(record)
+
     return results
 
 
@@ -238,30 +337,48 @@ def require_approval(
 ) -> list[Approval]:
     """Return the approvals satisfying a policy, or raise :class:`ApprovalError`.
 
-    Only approvals that are both valid and made by a key the verifier already
-    holds can satisfy a policy — an approval signed by a key that arrived with
-    the model proves nothing.
+    Only approvals that are valid, in an unbroken chain, and made by a key the
+    verifier already holds can satisfy a policy — an approval signed by a key
+    that arrived with the model proves nothing.
+
+    Every role in ``roles`` must be satisfied, not merely one of them, and
+    ``count`` counts **distinct** approvers: two approvals from one key are one
+    person however many roles they are recorded under.
     """
     approvals = read_approvals(sig, pubkeys=pubkeys, keyring_dir=keyring_dir)
-    wanted_fingerprints = {f for f in fingerprints}
-    wanted_roles = {r for r in roles}
+    usable = [a for a in approvals if a.ok]
 
-    matching = [
-        a
-        for a in approvals
-        if a.ok
-        and (not wanted_fingerprints or a.key_fingerprint in wanted_fingerprints)
-        and (not wanted_roles or a.role in wanted_roles)
-    ]
-    if len(matching) < count:
+    wanted_roles = list(dict.fromkeys(roles))
+    wanted_keys = {f for f in fingerprints}
+
+    if wanted_keys:
+        usable = [a for a in usable if a.key_fingerprint in wanted_keys]
+
+    # Every role asked for has to be satisfied, not any one of them.
+    missing = [role for role in wanted_roles if not any(a.role == role for a in usable)]
+    if missing:
+        raise ApprovalError(
+            "missing trusted approval for role(s): "
+            + ", ".join(missing)
+            + f"; {len(approvals)} approval(s) present in total, "
+            f"{len(usable)} usable"
+        )
+
+    if wanted_roles:
+        usable = [a for a in usable if a.role in wanted_roles]
+
+    # A quorum counts distinct signing identities. Two approvals from one key,
+    # in two roles, are one person.
+    distinct = {a.public_key for a in usable if a.public_key}
+    if len(distinct) < count:
         detail = []
         if wanted_roles:
             detail.append("role in " + ", ".join(sorted(wanted_roles)))
-        if wanted_fingerprints:
-            detail.append("key in " + ", ".join(sorted(wanted_fingerprints)))
+        if wanted_keys:
+            detail.append("key in " + ", ".join(sorted(wanted_keys)))
         constraint = (" (" + "; ".join(detail) + ")") if detail else ""
         raise ApprovalError(
-            f"needed {count} trusted approval(s){constraint}, found {len(matching)}; "
-            f"{len(approvals)} approval(s) present in total"
+            f"needed {count} distinct trusted approver(s){constraint}, "
+            f"found {len(distinct)}; {len(approvals)} approval(s) present in total"
         )
-    return matching
+    return usable

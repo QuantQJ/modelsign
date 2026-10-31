@@ -204,7 +204,7 @@ _FAILURE_LINES = {
     "--require-approval",
     "required_roles",
     multiple=True,
-    help="Fail unless a trusted key has approved the model in this role. Repeatable.",
+    help="Fail unless a trusted key approved in this role. Repeatable; all are required.",
 )
 @click.option(
     "--approver-key",
@@ -216,7 +216,7 @@ _FAILURE_LINES = {
     "--min-approvals",
     default=0,
     type=int,
-    help="Fail unless at least this many trusted approvals are present.",
+    help="Fail unless this many distinct trusted approvers signed off.",
 )
 @click.option(
     "--allow-unbound-name",
@@ -269,7 +269,7 @@ def verify(
             approvals = require_approval(
                 sig_path or default_sig_path(model_path),
                 roles=required_roles,
-                count=max(min_approvals, 1 if required_roles else 0),
+                count=min_approvals,
                 pubkeys=list(approver_keys),
                 keyring_dir=DEFAULT_KEY_DIR / "keyring",
             )
