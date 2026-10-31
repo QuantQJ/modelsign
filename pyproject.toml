@@ -43,5 +43,17 @@ version = {attr = "modelsign.__version__"}
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.mypy]
+# mypy itself no longer targets 3.9; the 3.9 CI leg is what proves 3.9 works.
+python_version = "3.10"
+files = ["src/modelsign"]
+warn_unused_ignores = true
+warn_redundant_casts = true
+
+[[tool.mypy.overrides]]
+# Optional at runtime and unstubbed; the guard imports them defensively.
+module = ["huggingface_hub.*", "transformers.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

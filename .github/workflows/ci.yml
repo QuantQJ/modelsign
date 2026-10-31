@@ -38,6 +38,9 @@ jobs:
       - name: Run tests
         run: pytest tests/ -v --tb=short
 
+      - name: Type check
+        run: mypy
+
   action:
     needs: test
     runs-on: ubuntu-latest

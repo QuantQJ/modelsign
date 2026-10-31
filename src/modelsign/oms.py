@@ -25,7 +25,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
@@ -69,7 +69,13 @@ def pae_compat(payload: bytes) -> bytes:
     message contains a Python bytes repr. Signatures from it only verify
     against this encoding.
     """
-    header = f"DSSEV1 {len(PAYLOAD_TYPE)} {PAYLOAD_TYPE} {len(payload)} {payload}"
+    # Interpolating bytes into a string is the bug being reproduced, not a
+    # mistake here: model_signing 0.2.0 did exactly this, so its signatures
+    # only verify against a message containing the bytes' repr.
+    header = (
+        f"DSSEV1 {len(PAYLOAD_TYPE)} {PAYLOAD_TYPE} "
+        f"{len(payload)} {payload}"  # type: ignore[str-bytes-safe]
+    )
     return header.encode("utf-8")
 
 
@@ -429,7 +435,7 @@ def verify_bundle(
                 f"file {model_path.name!r}; point it at the signed directory"
             )
 
-    result_fields = dict(
+    result_fields: dict[str, Any] = dict(
         model=str(model_path),
         fingerprint=key_hint(public_key)[:16],
         trust=TRUST_PUBKEY,

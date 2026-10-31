@@ -135,8 +135,8 @@ class _HubGuard:
     def _wrap_file(self, original: Callable) -> Callable:
         def guarded(*args: Any, **kwargs: Any) -> Any:
             local = Path(original(*args, **kwargs))
-            sig = default_sig_path(local)
-            if not sig.exists():
+            sig: Optional[Path] = default_sig_path(local)
+            if sig is not None and not sig.exists():
                 sig = self._fetch_sig(original, local, args, kwargs)
             if sig is None:
                 self._unsigned(local)
@@ -277,14 +277,15 @@ class _HubGuard:
 
     def _install_local_loaders(self) -> None:
         """Guard from_pretrained for paths that never touch the Hub."""
-        transformers = sys.modules.get("transformers")
-        if transformers is None:
+        module = sys.modules.get("transformers")
+        if module is None:
             try:
-                import transformers  # noqa: F811
+                import transformers
             except Exception:
                 return
+            module = transformers
 
-        base = getattr(transformers, "PreTrainedModel", None)
+        base = getattr(module, "PreTrainedModel", None)
         if base is None:
             return
         original = base.__dict__.get("from_pretrained")

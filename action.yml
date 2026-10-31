@@ -20,10 +20,6 @@ inputs:
     description: 'Path to the OMS bundle (default: model.sig beside the model).'
     required: false
     default: ''
-  require-trusted:
-    description: 'Fail when only the signature''s own embedded key is available.'
-    required: false
-    default: 'true'
   version:
     description: 'modelsign version to install (default: latest).'
     required: false
@@ -57,7 +53,6 @@ runs:
         PUBKEY: ${{ inputs.pubkey }}
         OMS_PUBKEY: ${{ inputs.oms-pubkey }}
         BUNDLE: ${{ inputs.bundle }}
-        REQUIRE_TRUSTED: ${{ inputs.require-trusted }}
       run: |
         set -euo pipefail
 
@@ -73,9 +68,6 @@ runs:
           fi
         else
           args=(verify "$MODEL" --pubkey "$PUBKEY")
-          if [ "$REQUIRE_TRUSTED" = "true" ]; then
-            args+=(--require-trusted)
-          fi
         fi
 
         echo "::group::modelsign ${args[*]}"

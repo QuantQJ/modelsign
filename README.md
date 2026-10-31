@@ -245,7 +245,7 @@ installs `modelsign` and fails the job on an unverified model:
 - uses: QuantQJ/modelsign@v1
   with:
     model: ./model
-    pubkey: ./keys/vendor.pem        # require-trusted is on by default
+    pubkey: ./keys/vendor.pem
 ```
 
 For a repository signed with OpenSSF Model Signing:
